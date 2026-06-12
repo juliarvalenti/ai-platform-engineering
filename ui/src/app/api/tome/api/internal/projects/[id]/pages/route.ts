@@ -12,6 +12,18 @@ export const dynamic = "force-dynamic";
 
 type Ctx = { params: Promise<{ id: string }> };
 
+// All current pages as a `{ path: markdown }` map. The agent calls this at the
+// start of each chat/ingest turn to rehydrate its `/project` working copy from
+// the source of truth (Mongo), so it never reads stale files.
+export const GET = withErrorHandler(async (request: NextRequest, ctx: Ctx) => {
+  requireAgentToken(request);
+  const { id } = await ctx.params;
+  const project = await resolveProject(id);
+  const store = await getPageStore();
+  const pages = await store.listPages(project._id);
+  return Response.json(pages);
+});
+
 export const POST = withErrorHandler(async (request: NextRequest, ctx: Ctx) => {
   requireAgentToken(request);
   const { id } = await ctx.params;

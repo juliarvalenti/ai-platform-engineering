@@ -1,0 +1,400 @@
+"""Shared core for the agent container's chat and ingest surfaces.
+
+Both call the same `build_agent_options()` factory; only the system
+prompt and the seed message differ.
+
+- `cwd` is the container-local mount `/project` (env `TTT_PROJECT_ROOT`).
+- The persist hook POSTs to `ttt-backend/internal/projects/{id}/pages`
+  via `http_client.write_page` — sqlite is unreachable from the container.
+- Connectors are snapshot-driven and tokens come from env (the
+  orchestrator injects them at container start).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+from collections.abc import Callable
+from typing import Any
+from pathlib import Path
+from uuid import UUID
+
+from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
+
+from tome_agent.agent import http_client
+from tome_agent.agent.connectors import REGISTRY
+from tome_agent.agent.connectors.base import SourceItem
+
+log = logging.getLogger("tome_agent.agent.loop")
+
+WIKI_TOOLS = ["Read", "Edit", "Write", "Glob", "Grep"]
+WEB_TOOLS = ["WebFetch", "WebSearch"]
+
+
+def project_root() -> Path:
+    """The wiki dir mounted into the agent container. Backend bind-mounts
+    `data/wiki/{project_id}` here at start."""
+    return Path(os.environ.get("TTT_PROJECT_ROOT", "/project"))
+
+
+def _rehydrate_project(pdir: Path) -> None:
+    """Refresh the `/project` working copy from the backend (source of truth)
+    at the start of each run, so the agent's Read/Glob/Grep tools never see
+    stale content after UI edits or prior-turn agent writes. Best-effort: on
+    failure we keep whatever is already on disk."""
+    try:
+        pages = http_client.fetch_all_pages_sync()
+    except Exception:
+        log.warning("project rehydrate failed; using existing /project", exc_info=True)
+        return
+    for path, md in pages.items():
+        try:
+            fp = pdir / path
+            fp.parent.mkdir(parents=True, exist_ok=True)
+            fp.write_text(md)
+        except OSError:
+            log.warning("rehydrate: could not write %s", path, exc_info=True)
+
+
+def _normalize_repo_slug(repo: str) -> str | None:
+    """`https://github.com/foo/bar.git` → `foo/bar`. None on garbage input."""
+    s = repo.strip().rstrip("/")
+    for prefix in ("https://github.com/", "github.com/"):
+        if s.startswith(prefix):
+            s = s[len(prefix):]
+    if s.endswith(".git"):
+        s = s[: -len(".git")]
+    parts = s.split("/")
+    if len(parts) < 2 or not parts[0] or not parts[1]:
+        return None
+    return f"{parts[0]}/{parts[1]}"
+
+
+def build_citation_guidance(repos: list[str]) -> str:
+    canonical = [r for r in (_normalize_repo_slug(r) for r in repos) if r]
+    if not canonical:
+        return (
+            "CITATION FORMAT: When you cite a commit, issue, or PR, use a normal "
+            "markdown link like `[commit `a1b2c3d`](URL)` so the renderer makes "
+            "it clickable. If you don't know the canonical URL, leave the "
+            "citation as plain text in brackets — the renderer has a fallback."
+        )
+
+    primary = canonical[0]
+    examples = [
+        f"`[commit `a1b2c3d`](https://github.com/{primary}/commit/a1b2c3d)`",
+        f"`[issue #142](https://github.com/{primary}/issues/142)`",
+        f"`[PR #99](https://github.com/{primary}/pull/99)`",
+        "`[@alice](https://github.com/alice)` for people (or just write `@alice` — the renderer resolves it)",
+    ]
+
+    repo_list = "\n".join(f"  - https://github.com/{r}" for r in canonical)
+    return (
+        "CITATION FORMAT: When you cite something, use a markdown link so the "
+        "renderer makes it clickable.\n\n"
+        f"Project repos:\n{repo_list}\n\n"
+        "Examples (use the repo the item lives in — don't guess across repos):\n"
+        + "\n".join(f"  - {e}" for e in examples)
+        + "\n\nIf you don't know the canonical URL for a citation, leave it as plain "
+        "bracketed text (e.g. `[commit a1b2c3d]`) — there's a renderer-side "
+        "fallback that resolves common patterns."
+    )
+
+
+def make_deny_unsafe_tools_hook():
+    """PreToolUse hook that hard-denies tools that bypass the persist hook
+    or grant arbitrary code execution (Bash can `cat > path` past the
+    Edit/Write persist hook, desyncing the FS cache from sqlite)."""
+    DENIED = {"Bash", "BashOutput", "KillShell", "AskUserQuestion"}
+
+    async def deny(input_data, _tool_use_id, _context):
+        tool_name = input_data.get("tool_name", "")
+        if tool_name in DENIED:
+            reason = (
+                f"{tool_name} is not available to TTT agents. There is no "
+                "interactive user — you cannot ask questions or run shells. "
+                "Use Edit / Write for file changes (so the persist hook records "
+                "them in sqlite). For code-level repo inspection, use the github "
+                "MCP tools (github_get_file, github_list_dir)."
+            )
+            log.warning(
+                "denied unsafe tool call: %s (input: %.200s)",
+                tool_name,
+                str(input_data.get("tool_input", {})),
+            )
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": reason,
+                }
+            }
+        return {}
+
+    return deny
+
+
+def make_constrain_writes_hook(project_dir: Path):
+    """PreToolUse hook denying Write/Edit calls outside `project_dir`.
+
+    SDK's `cwd` is a hint; this hook is the actual sandbox. Inside the
+    agent container `/project` is bind-mounted, so paths outside it
+    would mean the model is trying to write to its own image — refuse."""
+    project_dir_resolved = project_dir.resolve()
+
+    async def constrain(input_data, _tool_use_id, _context):
+        tool_name = input_data.get("tool_name", "")
+        if tool_name not in {"Edit", "Write"}:
+            return {}
+        tool_input = input_data.get("tool_input") or {}
+        file_path = tool_input.get("file_path") or tool_input.get("path")
+        if not file_path:
+            return {}
+        try:
+            abs_path = Path(file_path).resolve()
+            abs_path.relative_to(project_dir_resolved)
+        except (ValueError, OSError):
+            log.warning("denied %s outside project dir: %s", tool_name, file_path)
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": (
+                        f"{tool_name} target {file_path!r} is outside the project's "
+                        f"wiki directory ({project_dir_resolved}). All wiki pages must "
+                        "be written under your cwd as relative paths (e.g. "
+                        "`overview.md`, `repos/<slug>/status.md`)."
+                    ),
+                }
+            }
+        return {}
+
+    return constrain
+
+
+def make_persist_hook(
+    *,
+    author: str,
+    report_id: UUID | None,
+    on_write: Callable[[str, int], Any] | None = None,
+):
+    """PostToolUse hook that POSTs every Edit/Write of a file under
+    `project_root()` to `ttt-backend/internal/projects/{id}/pages`.
+
+    `report_id` tags the revision with the ingest run's Report (None for
+    chat edits). `on_write(page_path, byte_count)` runs after a
+    successful POST — the ingest agent uses it to emit a log SSE event."""
+    pdir = project_root().resolve()
+
+    async def persist(input_data, _tool_use_id, _context):
+        tool_name = input_data.get("tool_name", "")
+        if tool_name not in {"Edit", "Write"}:
+            return {}
+        tool_input = input_data.get("tool_input") or {}
+        file_path = tool_input.get("file_path") or tool_input.get("path")
+        log.debug("persist hook fired: tool=%s path=%s", tool_name, file_path)
+        if not file_path:
+            return {}
+        try:
+            abs_path = Path(file_path).resolve()
+            rel = abs_path.relative_to(pdir)
+        except (ValueError, OSError):
+            return {}
+        if not abs_path.exists():
+            return {}
+        try:
+            content = abs_path.read_text()
+            page_path = str(rel).replace("\\", "/")
+            await http_client.write_page(
+                page_path=page_path,
+                body=content,
+                message=f"{author}: {page_path}",
+                author=author,
+                report_id=report_id,
+            )
+            log.info("agent persisted %s (report_id=%s)", page_path, report_id)
+            if on_write is not None:
+                try:
+                    res = on_write(page_path, len(content))
+                    if asyncio.iscoroutine(res):
+                        await res
+                except Exception:
+                    log.exception("on_write callback raised; ignoring")
+        except Exception:
+            log.exception("agent persist failed for %s", file_path)
+        return {}
+
+    return persist
+
+
+def sources_to_items(snapshot_sources, *, kind: str) -> list[SourceItem]:
+    """Translate `ProjectSnapshot.{repos,webex_rooms,confluence_spaces}` →
+    connector-friendly `SourceItem`s. Each connector cares about
+    different fields, so the kind tag picks the right projection."""
+    if kind == "repos":
+        return [
+            SourceItem(slug=r.slug, display_name=r.url, extra={"url": r.url})
+            for r in snapshot_sources
+        ]
+    if kind == "webex_rooms":
+        return [SourceItem(slug=r.slug, display_name=r.name) for r in snapshot_sources]
+    if kind == "confluence_spaces":
+        return [
+            SourceItem(slug=s.slug, display_name=s.name, extra={"space_key": s.space_key})
+            for s in snapshot_sources
+        ]
+    raise ValueError(f"unknown source kind: {kind}")
+
+
+def sources_for_connector(snapshot, connector) -> list[SourceItem]:
+    """Map a connector slug to the right snapshot field."""
+    if connector.slug == "github":
+        return sources_to_items(snapshot.repos, kind="repos")
+    if connector.slug == "webex":
+        return sources_to_items(snapshot.webex_rooms, kind="webex_rooms")
+    if connector.slug == "confluence":
+        return sources_to_items(snapshot.confluence_spaces, kind="confluence_spaces")
+    return []
+
+
+def log_pre_tool(input_data, _tool_use_id, _context):
+    """Triggered right BEFORE the agent executes a tool."""
+    log.info(
+        f"🤖 Agent invoking tool: '{input_data.get('tool_name')}' | "
+        f"Arguments: {input_data.get('tool_input')} | "
+        f"Session ID: {_context.get('session_id')}"
+    )
+
+
+def log_post_tool(input_data, _tool_use_id, _context):
+    """Triggered right AFTER the tool finishes executing."""
+    # Truncate output if it's too massive for standard logs
+    preview_result = str(input_data.get("result"))[:200]
+    if len(str(input_data.get("result"))) > 200:
+        preview_result += "... [truncated]"
+
+    log.info(
+        f"✅ Tool '{input_data.get('tool_name')}' finished | "
+        f"Status: {'Success' if not input_data.get('is_error') else 'Error'} | "
+        f"Result Preview: {preview_result}"
+    )
+
+
+def build_agent_options(
+    *,
+    system_prompt: str,
+    model: str,
+    max_turns: int,
+    persist_author: str,
+    snapshot,
+    report_id: UUID | None = None,
+    resume: str | None = None,
+    include_partial_messages: bool = False,
+    on_write: Callable[[str, int], Any] | None = None,
+) -> ClaudeAgentOptions:
+    """Compose ClaudeAgentOptions for chat and ingest in the agent
+    container. MCP servers are scoped to the snapshot's sources."""
+
+    agent_role = os.environ.get("TTT_AGENT_ROLE", "editor")
+
+    pdir = project_root()
+    pdir.mkdir(parents=True, exist_ok=True)
+    _rehydrate_project(pdir)
+
+    mcp_servers: dict = {}
+    # Viewer containers have no write tools — Edit and Write are excluded
+    # from the allowed list so the SDK never offers them to Claude.
+    if agent_role == "viewer":
+        allowed = ["Read", "Glob", "Grep", *WEB_TOOLS]
+    else:
+        allowed = [*WIKI_TOOLS, *WEB_TOOLS]
+
+    for connector in REGISTRY:
+        token = _connector_token(connector.slug)
+        if not connector.is_enabled(token):
+            continue
+        sources = sources_for_connector(snapshot, connector)
+        mcp_servers[connector.slug] = connector.build_mcp(token=token, sources=sources)
+        allowed.extend(connector.mcp_tools)
+
+    claude_agent_env = {
+        "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
+        **(
+            {"ANTHROPIC_API_KEY": os.environ["ANTHROPIC_API_KEY"]}
+            if os.environ.get("ANTHROPIC_API_KEY")
+            else {}
+        ),
+        **(
+            {"ANTHROPIC_AUTH_TOKEN": os.environ["ANTHROPIC_AUTH_TOKEN"]}
+            if os.environ.get("ANTHROPIC_AUTH_TOKEN")
+            else {}
+        ),
+        **(
+            {"ANTHROPIC_BASE_URL": os.environ["ANTHROPIC_BASE_URL"]}
+            if os.environ.get("ANTHROPIC_BASE_URL")
+            else {}
+        ),
+    }
+    if "bedrock" in model:
+        claude_agent_env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"] = "1"
+
+    return ClaudeAgentOptions(
+        cwd=str(pdir),
+        allowed_tools=allowed,
+        permission_mode="acceptEdits",
+        system_prompt=system_prompt,
+        model=model,
+        resume=resume,
+        setting_sources=["project","local"], # ignore user
+        skills="all",
+        session_store=None,  # don't persist sessions
+        mcp_servers=mcp_servers,
+        env=claude_agent_env,
+        debug_stderr=True,
+        include_partial_messages=include_partial_messages,
+        max_turns=max_turns,
+        hooks={
+            "PreToolUse": [
+                HookMatcher(
+                    matcher="Bash|BashOutput|KillShell|AskUserQuestion",
+                    hooks=[make_deny_unsafe_tools_hook()],
+                ),
+                HookMatcher(
+                    matcher="Edit|Write",
+                    hooks=[make_constrain_writes_hook(pdir)],
+                ),
+                HookMatcher(
+                    matcher="*",
+                    hooks=[log_pre_tool],
+                ),
+            ],
+            "PostToolUse": [
+                HookMatcher(
+                    matcher="Edit|Write",
+                    hooks=[
+                        make_persist_hook(
+                            author=persist_author,
+                            report_id=report_id,
+                            on_write=on_write,
+                        )
+                    ],
+                ),
+                HookMatcher(
+                    matcher="*",
+                    hooks=[log_post_tool],
+                ),
+            ],
+        },
+    )
+
+
+def _connector_token(slug: str) -> str:
+    """Per-connector token resolution from env. Empty string when missing."""
+    if slug == "github":
+        return os.environ.get("GITHUB_TOKEN", "")
+    if slug == "webex":
+        return os.environ.get("WEBEX_TOKEN", "")
+    if slug == "confluence":
+        return os.environ.get("CONFLUENCE_TOKEN", "")
+    return ""
