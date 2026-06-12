@@ -92,7 +92,7 @@ export function KindBadge({
         </TooltipTrigger>
         <TooltipContent
           side="right"
-          className="flex w-64 flex-col gap-1 text-[11px] font-normal normal-case leading-relaxed"
+          className="flex w-64 flex-col gap-1 whitespace-normal text-[11px] font-normal normal-case leading-relaxed"
         >
           <span className="text-xs font-semibold">{spec.title}</span>
           <span className="opacity-70">{spec.description}</span>

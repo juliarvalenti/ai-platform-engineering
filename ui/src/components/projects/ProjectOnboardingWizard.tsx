@@ -9,6 +9,7 @@ import {
   CheckCircle2,
   ChevronDown,
   FolderKanban,
+  ListChecks,
   Loader2,
   MessageSquare,
   Rocket,
@@ -18,11 +19,21 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import Link from "next/link";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 
 import { TeamPicker, type TeamPickerOption } from "@/components/ui/team-picker";
+import { SourcePicker } from "@/components/projects/source-pickers";
 import { cn } from "@/lib/utils";
 import type { ProjectDocument } from "@/types/projects";
+
+type SourceKind = "github" | "confluence" | "webex";
 
 interface OnboardingStepConfig {
   id: string;
@@ -31,6 +42,8 @@ interface OnboardingStepConfig {
   icon?: string;
   gradient?: string;
   checklist?: string[];
+  provider?: "mock" | "none" | "http" | "link" | "source";
+  source?: SourceKind;
 }
 
 interface WizardStepMeta {
@@ -40,6 +53,9 @@ interface WizardStepMeta {
   icon: LucideIcon;
   gradient: string;
   checklist?: string[];
+  /** create = name/team; source = a pre-create source picker; review = confirm + commit; provision = http/link/mock; complete = success. */
+  kind: "create" | "source" | "review" | "provision" | "complete";
+  source?: SourceKind;
 }
 
 const ICONS: Record<string, LucideIcon> = {
@@ -66,23 +82,45 @@ function buildWizardSteps(configSteps: OnboardingStepConfig[]): WizardStepMeta[]
     subtitle: "Name your initiative and assign a team",
     icon: FolderKanban,
     gradient: DEFAULT_GRADIENT,
+    kind: "create",
   };
-  const provisionSteps: WizardStepMeta[] = configSteps.map((step) => ({
+  const toMeta = (step: OnboardingStepConfig, kind: "source" | "provision"): WizardStepMeta => ({
     id: step.id,
     title: step.title,
     subtitle: step.subtitle,
     icon: resolveIcon(step.icon),
     gradient: step.gradient ?? DEFAULT_GRADIENT,
     checklist: step.checklist,
-  }));
+    kind,
+    source: step.source,
+  });
+  // Source steps are pre-create (they feed the create payload), so they always
+  // precede the provision steps regardless of YAML order.
+  const sourceSteps = configSteps
+    .filter((s) => s.provider === "source")
+    .map((s) => toMeta(s, "source"));
+  const provisionSteps = configSteps
+    .filter((s) => s.provider !== "source")
+    .map((s) => toMeta(s, "provision"));
+  // The project is committed on the review step (provision steps POST against
+  // its id), so review sits after sources and before provisioning.
+  const review: WizardStepMeta = {
+    id: "review",
+    title: "Review & Create",
+    subtitle: "Confirm and create the project",
+    icon: ListChecks,
+    gradient: DEFAULT_GRADIENT,
+    kind: "review",
+  };
   const complete: WizardStepMeta = {
     id: "complete",
-    title: "Review & Create",
+    title: "Done",
     subtitle: "Your project is ready",
     icon: Rocket,
     gradient: "from-emerald-600 via-green-600 to-teal-600",
+    kind: "complete",
   };
-  return [create, ...provisionSteps, complete];
+  return [create, ...sourceSteps, review, ...provisionSteps, complete];
 }
 
 interface StepRunState {
@@ -107,18 +145,10 @@ export function ProjectOnboardingWizard({
   const [teamId, setTeamId] = useState("");
   const [initiativesRaw, setInitiativesRaw] = useState("");
   const [swimlanesRaw, setSwimlanesRaw] = useState("");
-  // User-shared data sources (forwarded to connected external apps on onboarding).
+  // User-shared data sources (collected by the configured `source` steps;
+  // forwarded to connected external apps on onboarding).
   const [githubReposRaw, setGithubReposRaw] = useState("");
   const [confluenceUrl, setConfluenceUrl] = useState("");
-  // Live source options from the user's provider connections (Connections tab).
-  type SourceState = {
-    connected: boolean;
-    options: { value: string; label: string }[];
-    connectedTo?: string;
-  };
-  const [ghSources, setGhSources] = useState<SourceState>({ connected: false, options: [] });
-  const [cfSources, setCfSources] = useState<SourceState>({ connected: false, options: [] });
-  const ghSearchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // "Look up from Backstage" — pre-fill the create form from an existing System.
   type BackstageResult = {
     slug: string;
@@ -147,11 +177,22 @@ export function ProjectOnboardingWizard({
 
   const wizardSteps = useMemo(() => buildWizardSteps(configSteps), [configSteps]);
   const phase = wizardSteps[phaseIndex] ?? wizardSteps[0];
-  const firstProvisionIndex = 1;
   const completeIndex = wizardSteps.length - 1;
-  const hasProvisionSteps = configSteps.length > 0;
-  const isProvisionPhase =
-    phase.id !== "create" && phase.id !== "complete" && hasProvisionSteps;
+  const sourceStepCount = useMemo(
+    () => wizardSteps.filter((s) => s.kind === "source").length,
+    [wizardSteps],
+  );
+  const hasProvisionSteps = useMemo(
+    () => wizardSteps.some((s) => s.kind === "provision"),
+    [wizardSteps],
+  );
+  // Layout: create=0, source steps occupy 1..sourceStepCount, then the review
+  // step (where the project is committed), then provision steps, then complete.
+  const reviewIndex = 1 + sourceStepCount;
+  const firstProvisionIndex = reviewIndex + 1;
+  const isSourcePhase = phase.kind === "source";
+  const isReviewPhase = phase.kind === "review";
+  const isProvisionPhase = phase.kind === "provision";
   const currentStepRun = isProvisionPhase ? stepRuns[phase.id] : undefined;
   const currentStepDone =
     project?.onboarding?.[phase.id]?.status === "completed" ||
@@ -159,29 +200,6 @@ export function ProjectOnboardingWizard({
   const currentStepFailed =
     project?.onboarding?.[phase.id]?.status === "failed" ||
     currentStepRun?.phase === "failed";
-
-  // Live source dropdowns from the user's connections (Connections tab).
-  const loadSources = useCallback(() => {
-    (
-      [
-        ["github", setGhSources],
-        ["atlassian", setCfSources],
-      ] as const
-    ).forEach(([provider, setter]) => {
-      fetch(`/api/projects/source-options?provider=${provider}`)
-        .then((r) => (r.ok ? r.json() : null))
-        .then((b) => {
-          const data = b?.data ?? b;
-          if (!data) return;
-          setter({
-            connected: Boolean(data.connected),
-            options: Array.isArray(data.options) ? data.options : [],
-            connectedTo: typeof data.connectedTo === "string" ? data.connectedTo : undefined,
-          });
-        })
-        .catch(() => undefined);
-    });
-  }, []);
 
   // Backstage lookup: debounced search of existing Systems.
   const lookupBackstage = useCallback((q: string) => {
@@ -211,54 +229,14 @@ export function ProjectOnboardingWizard({
     setBsOpen(false);
   }, []);
 
-  // As the user types a GitHub owner/org (last comma-separated token), re-query
-  // that owner's repos so the dropdown reflects what they typed. We send the
-  // full `owner/name-fragment` so the server can search the org by repo name
-  // (token-scoped, includes private) rather than just listing the first page.
-  const searchGithubRepos = useCallback((text: string) => {
-    if (ghSearchTimer.current) clearTimeout(ghSearchTimer.current);
-    const token = (text.split(/[\n,]/).pop() ?? "")
-      .trim()
-      .replace(/^https?:\/\/github\.com\//i, "");
-    const owner = token.split("/")[0].trim();
-    if (!owner) return;
-    ghSearchTimer.current = setTimeout(() => {
-      fetch(`/api/projects/source-options?provider=github&q=${encodeURIComponent(token)}`)
-        .then((r) => (r.ok ? r.json() : null))
-        .then((b) => {
-          const d = b?.data ?? b;
-          if (d && d.connected) {
-            setGhSources({
-              connected: true,
-              options: Array.isArray(d.options) ? d.options : [],
-              connectedTo: typeof d.connectedTo === "string" ? d.connectedTo : undefined,
-            });
-          }
-        })
-        .catch(() => undefined);
-    }, 400);
-  }, []);
-
   useEffect(() => {
     if (!open) return;
-    loadSources();
     // Probe whether Backstage lookup is available (shows the button if so).
     fetch("/api/projects/backstage/lookup")
       .then((r) => (r.ok ? r.json() : null))
       .then((b) => setBsConfigured(Boolean((b?.data ?? b)?.configured)))
       .catch(() => undefined);
-    // Re-check after the user authorizes a provider in another tab and returns.
-    const onFocus = () => loadSources();
-    const onVisible = () => {
-      if (document.visibilityState === "visible") loadSources();
-    };
-    window.addEventListener("focus", onFocus);
-    document.addEventListener("visibilitychange", onVisible);
-    return () => {
-      window.removeEventListener("focus", onFocus);
-      document.removeEventListener("visibilitychange", onVisible);
-    };
-  }, [open, loadSources]);
+  }, [open]);
 
   useEffect(() => {
     if (!open) return;
@@ -468,7 +446,14 @@ export function ProjectOnboardingWizard({
   }
 
   async function handlePrimaryAction() {
-    if (phase.id === "create") {
+    // Create + source steps just advance toward the review step — nothing is
+    // committed yet.
+    if (phase.kind === "create" || phase.kind === "source") {
+      advanceFromCurrentStep();
+      return;
+    }
+    // Review is the commit: this is the only place the project is POSTed.
+    if (isReviewPhase) {
       await createProject();
       return;
     }
@@ -485,11 +470,14 @@ export function ProjectOnboardingWizard({
     }
   }
 
-  const primaryLabel =
-    phase.id === "create"
+  const isPreCreate = phase.kind === "create" || phase.kind === "source";
+
+  const primaryLabel = isPreCreate
+    ? "Continue"
+    : isReviewPhase
       ? provisioning
         ? "Creating…"
-        : "Create & Continue"
+        : "Create project"
       : isProvisionPhase
         ? provisioning || currentStepRun?.phase === "calling"
           ? "Provisioning…"
@@ -505,13 +493,14 @@ export function ProjectOnboardingWizard({
           : "";
 
   const showPrimary =
-    phase.id === "create" ||
-    isProvisionPhase ||
-    phase.id === "complete";
+    isPreCreate || isReviewPhase || isProvisionPhase || phase.id === "complete";
 
   const primaryDisabled =
     provisioning ||
-    (phase.id === "create" && (!projectName.trim() || !teamId)) ||
+    // Name + team are required; enforce on the create step and again at the
+    // review/commit step as a guard.
+    ((phase.kind === "create" || isReviewPhase) &&
+      (!projectName.trim() || !teamId)) ||
     (isProvisionPhase &&
       !currentStepDone &&
       !currentStepFailed &&
@@ -717,16 +706,6 @@ export function ProjectOnboardingWizard({
                         className="w-full rounded-xl border border-border/60 bg-muted/30 px-4 py-3 text-sm outline-none ring-primary/30 focus:border-primary focus:ring-2"
                       />
                     </label>
-                    <div className="space-y-1.5">
-                      <span className="text-sm font-medium">Team</span>
-                      <TeamPicker
-                        options={teams}
-                        value={teamId}
-                        onChange={setTeamId}
-                        placeholder="Select owning team"
-                        hideSlugSuffix
-                      />
-                    </div>
                   </div>
                   <div className="space-y-4">
                     <label className="block space-y-1.5">
@@ -753,57 +732,145 @@ export function ProjectOnboardingWizard({
                       />
                       <span className="text-xs text-muted-foreground">Pick existing or type a new one (comma-separated).</span>
                     </label>
-                    <label className="block space-y-1.5">
-                      <span className="text-sm font-medium">GitHub repos</span>
-                      <ComboBox
-                        ariaLabel="GitHub repos"
-                        value={githubReposRaw}
-                        onChange={setGithubReposRaw}
-                        onType={searchGithubRepos}
-                        options={ghSources.options}
-                        placeholder="https://github.com/org/repo, https://github.com/org/another"
-                        multi
-                      />
-                      {ghSources.connected ? (
-                        <span className="text-xs text-muted-foreground">
-                          {ghSources.connectedTo ? (
-                            <>Connected as <span className="text-emerald-500">{ghSources.connectedTo}</span> · </>
-                          ) : null}
-                          type <code>org/name</code> to search that org (your private repos included); select multiple.
-                        </span>
-                      ) : (
-                        <AuthorizePrompt provider="GitHub" onRecheck={loadSources} />
-                      )}
-                    </label>
-                    <label className="block space-y-1.5">
-                      <span className="text-sm font-medium">Confluence space URL</span>
-                      <ComboBox
-                        ariaLabel="Confluence space URL"
-                        value={confluenceUrl}
-                        onChange={setConfluenceUrl}
-                        options={cfSources.options}
-                        placeholder="https://your.atlassian.net/wiki/spaces/PROJ"
-                      />
-                      {cfSources.connected ? (
-                        <span className="text-xs text-muted-foreground">
-                          {cfSources.connectedTo ? (
-                            <>Connected to <span className="text-emerald-500">{cfSources.connectedTo}</span> · pick a space or paste a URL.</>
-                          ) : (
-                            <>Pick a space or paste a URL.</>
-                          )}
-                        </span>
-                      ) : (
-                        <AuthorizePrompt provider="Confluence" onRecheck={loadSources} />
-                      )}
-                    </label>
+                    {/* Sources are strictly YAML-driven: they live in their own
+                        `source` wizard steps when the onboarding config defines
+                        them, and are not collected on the create step. */}
                     <div className="rounded-xl border border-dashed border-primary/30 bg-primary/5 p-4 text-xs text-muted-foreground">
                       Projects belong to teams and can sync to Backstage as{" "}
                       <code className="text-primary">kind: System</code>. Labels (Domain ·
                       BHAG · Swim Lane) power the executive dashboard.
                     </div>
                   </div>
+                  {/* Team gets its own full-width row — it's required. */}
+                  <div className="space-y-1.5 md:col-span-2">
+                    <span className="text-sm font-medium">Team</span>
+                    <TeamPicker
+                      options={teams}
+                      value={teamId}
+                      onChange={setTeamId}
+                      placeholder="Select owning team"
+                      hideSlugSuffix
+                    />
+                    {teams.length === 0 && (
+                      <span className="text-xs text-muted-foreground">
+                        No teams available — ask an admin to add you to one (a
+                        project must belong to a team).
+                      </span>
+                    )}
+                  </div>
                 </div>
               ) : null}
+
+              {isSourcePhase ? (
+                <div className="space-y-3">
+                  <SourcePicker
+                    source={phase.source}
+                    selected={
+                      phase.source === "github"
+                        ? githubReposRaw
+                            .split(/[\n,]/)
+                            .map((s) => s.trim())
+                            .filter(Boolean)
+                        : phase.source === "confluence"
+                          ? confluenceUrl.trim()
+                            ? [confluenceUrl.trim()]
+                            : []
+                          : []
+                    }
+                    onChange={(next) => {
+                      if (phase.source === "github")
+                        setGithubReposRaw(next.join(", "));
+                      else if (phase.source === "confluence")
+                        setConfluenceUrl(next[0] ?? "");
+                    }}
+                  />
+                </div>
+              ) : null}
+
+              {isReviewPhase
+                ? (() => {
+                    const repos = githubReposRaw
+                      .split(/[\n,]/)
+                      .map((s) => s.trim())
+                      .filter(Boolean);
+                    const initiatives = initiativesRaw
+                      .split(",")
+                      .map((s) => s.trim())
+                      .filter(Boolean);
+                    const swimlanes = swimlanesRaw
+                      .split(",")
+                      .map((s) => s.trim())
+                      .filter(Boolean);
+                    const team = teams.find(
+                      (t) =>
+                        t.id === teamId || t._id === teamId || t.slug === teamId,
+                    );
+                    const teamLabel = team?.name?.trim() || team?.slug || teamId;
+                    const Row = ({
+                      label,
+                      children,
+                    }: {
+                      label: string;
+                      children: ReactNode;
+                    }) => (
+                      <div className="grid grid-cols-[8rem_1fr] gap-3 px-4 py-3 text-sm">
+                        <span className="text-muted-foreground">{label}</span>
+                        <span className="min-w-0 break-words">{children}</span>
+                      </div>
+                    );
+                    const muted = (
+                      <span className="text-muted-foreground">—</span>
+                    );
+                    return (
+                      <div className="space-y-4">
+                        <p className="text-sm text-muted-foreground">
+                          Nothing has been created yet. Confirm the details below
+                          — clicking <span className="font-medium">Create project</span>{" "}
+                          commits it
+                          {hasProvisionSteps ? " and starts onboarding." : "."}
+                        </p>
+                        <div className="divide-y divide-border/50 rounded-xl border border-border/60 bg-muted/10">
+                          <Row label="Project">
+                            <span className="font-medium">
+                              {projectName.trim() || muted}
+                            </span>
+                          </Row>
+                          <Row label="Team">{teamLabel || muted}</Row>
+                          {description.trim() ? (
+                            <Row label="Description">{description.trim()}</Row>
+                          ) : null}
+                          <Row label="GitHub repos">
+                            {repos.length ? (
+                              <span className="flex flex-wrap gap-1.5">
+                                {repos.map((r) => (
+                                  <span
+                                    key={r}
+                                    className="rounded-md bg-muted px-2 py-0.5 text-xs"
+                                  >
+                                    {r.replace(/^https?:\/\/github\.com\//i, "")}
+                                  </span>
+                                ))}
+                              </span>
+                            ) : (
+                              muted
+                            )}
+                          </Row>
+                          <Row label="Confluence">
+                            {confluenceUrl.trim() || muted}
+                          </Row>
+                          {initiatives.length ? (
+                            <Row label="BHAG / Initiatives">
+                              {initiatives.join(", ")}
+                            </Row>
+                          ) : null}
+                          {swimlanes.length ? (
+                            <Row label="Swim Lanes">{swimlanes.join(", ")}</Row>
+                          ) : null}
+                        </div>
+                      </div>
+                    );
+                  })()
+                : null}
 
               {isProvisionPhase ? (
                 <ProvisioningCard
@@ -931,43 +998,6 @@ function ProvisioningCard({
         </>
       )}
     </div>
-  );
-}
-
-/**
- * Inline prompt shown when the user hasn't connected a provider — links to the
- * Connections tab to authorize, so the source dropdown can populate. The field
- * still accepts free-text in the meantime.
- */
-function AuthorizePrompt({
-  provider,
-  onRecheck,
-}: {
-  provider: string;
-  onRecheck?: () => void;
-}) {
-  return (
-    <span className="flex flex-wrap items-center gap-1.5 text-xs text-amber-500">
-      <span>Not connected.</span>
-      <a
-        href="/credentials"
-        target="_blank"
-        rel="noopener noreferrer"
-        className="font-medium underline underline-offset-2 hover:text-amber-400"
-      >
-        Authorize {provider}
-      </a>
-      <span className="text-muted-foreground">to pick from your account, or paste a URL.</span>
-      {onRecheck ? (
-        <button
-          type="button"
-          onClick={onRecheck}
-          className="font-medium text-primary underline underline-offset-2 hover:text-primary/80"
-        >
-          Recheck
-        </button>
-      ) : null}
-    </span>
   );
 }
 

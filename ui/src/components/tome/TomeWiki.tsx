@@ -1,10 +1,24 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { ArrowLeft, Eye, EyeOff, MessageSquare, RefreshCw } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  ArrowLeft,
+  Eye,
+  EyeOff,
+  MessageSquare,
+  Plus,
+  RefreshCw,
+  Upload,
+} from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { ChatPanel } from "@/components/tome/ChatPanel";
@@ -46,6 +60,11 @@ export function TomeWiki({ slug }: { slug: string }) {
   const [artifactPath, setArtifactPath] = useState<string | null>(null);
   const [showHidden, setShowHidden] = useState(false);
   const [seeding, setSeeding] = useState(false);
+  // "New page" popover + hidden file picker for the Wiki rail action cluster.
+  const [newPageOpen, setNewPageOpen] = useState(false);
+  const [newPageName, setNewPageName] = useState("");
+  const newPageInputRef = useRef<HTMLInputElement | null>(null);
+  const uploadInputRef = useRef<HTMLInputElement | null>(null);
 
   const load = useCallback(async () => {
     setError(null);
@@ -84,6 +103,74 @@ export function TomeWiki({ slug }: { slug: string }) {
       );
     },
     [slug],
+  );
+
+  // Create a page from a (possibly nested) path. Adds .md if no extension,
+  // seeds an H1 from the leaf name, then opens it. Backed by PUT /pages.
+  const createPage = useCallback(
+    async (rawPath: string) => {
+      let path = rawPath.trim().replace(/^\/+/, "");
+      if (!path) return;
+      if (!/\.(md|mdx)$/i.test(path)) path += ".md";
+      if (data?.pages[path] !== undefined) {
+        openPage(path);
+        return;
+      }
+      const leaf = path.replace(/\.(md|mdx)$/i, "").split("/").pop() ?? path;
+      try {
+        await writeMarkdown(path, `# ${leaf}\n`, `create ${path}`);
+        await load();
+        openPage(path);
+      } catch (e) {
+        setError(String((e as Error)?.message ?? e));
+      }
+    },
+    [data, writeMarkdown, load, openPage],
+  );
+
+  const deletePage = useCallback(
+    async (path: string) => {
+      if (typeof window !== "undefined" && !window.confirm(`Remove ${path}?`))
+        return;
+      try {
+        const res = await fetch(`/api/tome/projects/${slug}/pages/${path}`, {
+          method: "DELETE",
+        });
+        if (!res.ok) throw new Error(`delete failed (${res.status})`);
+        // Leave any view that was showing the now-deleted page.
+        setView((v) =>
+          v.kind === "page" && v.path === path ? { kind: "chat" } : v,
+        );
+        setArtifactPath((p) => (p === path ? null : p));
+        await load();
+      } catch (e) {
+        setError(String((e as Error)?.message ?? e));
+      }
+    },
+    [slug, load],
+  );
+
+  // Import .md/.mdx files as wiki pages (each file's text → PUT /pages).
+  // Nested layout is preserved via webkitRelativePath when a folder is dropped.
+  const uploadPages = useCallback(
+    async (files: FileList | File[]) => {
+      const list = Array.from(files).filter((f) => /\.(md|mdx)$/i.test(f.name));
+      if (list.length === 0) return;
+      try {
+        for (const f of list) {
+          const rel =
+            (f as File & { webkitRelativePath?: string }).webkitRelativePath ||
+            f.name;
+          const path = rel.replace(/^\/+/, "");
+          const text = await f.text();
+          await writeMarkdown(path, text, `upload ${path}`);
+        }
+        await load();
+      } catch (e) {
+        setError(String((e as Error)?.message ?? e));
+      }
+    },
+    [writeMarkdown, load],
   );
 
   const handleSeed = useCallback(async () => {
@@ -175,21 +262,128 @@ export function TomeWiki({ slug }: { slug: string }) {
                   onClick={() => setView({ kind: "ingest" })}
                 />
 
-                <div className="mt-4 flex items-center justify-between px-2 pb-1">
+                <div className="mt-4 flex items-center justify-between gap-1 px-2 pb-1">
                   <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
                     Wiki
                   </span>
-                  {!isEmpty && !loading && (
-                    <button
-                      type="button"
-                      onClick={() => setShowHidden((v) => !v)}
-                      title={showHidden ? "Hide agent-only pages" : "Show agent-only pages"}
-                      className="text-muted-foreground hover:text-foreground"
-                    >
-                      {showHidden ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
-                    </button>
-                  )}
+                  <div className="flex items-center gap-0.5 text-muted-foreground">
+                    {!isEmpty && !loading && (
+                      <button
+                        type="button"
+                        onClick={() => setShowHidden((v) => !v)}
+                        title={showHidden ? "Hide agent-only pages" : "Show agent-only pages"}
+                        className="rounded p-1 hover:bg-muted hover:text-foreground"
+                      >
+                        {showHidden ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                      </button>
+                    )}
+                    {!loading && (
+                      <button
+                        type="button"
+                        onClick={() => uploadInputRef.current?.click()}
+                        title="Upload .md files as pages (or drag onto the editor)"
+                        aria-label="Upload pages"
+                        className="rounded p-1 hover:bg-muted hover:text-foreground"
+                      >
+                        <Upload className="h-3.5 w-3.5" />
+                      </button>
+                    )}
+                    {!loading && (
+                      <Popover
+                        open={newPageOpen}
+                        onOpenChange={(o) => {
+                          setNewPageOpen(o);
+                          if (o) {
+                            setTimeout(() => newPageInputRef.current?.focus(), 0);
+                          } else {
+                            setNewPageName("");
+                          }
+                        }}
+                      >
+                        <PopoverTrigger asChild>
+                          <button
+                            type="button"
+                            title="New page"
+                            aria-label="New page"
+                            className="rounded p-1 hover:bg-muted hover:text-foreground"
+                          >
+                            <Plus className="h-3.5 w-3.5" />
+                          </button>
+                        </PopoverTrigger>
+                        <PopoverContent align="end" side="bottom" className="w-72 p-3">
+                          <form
+                            onSubmit={(e) => {
+                              e.preventDefault();
+                              const name = newPageName.trim();
+                              if (!name) return;
+                              void createPage(name);
+                              setNewPageOpen(false);
+                              setNewPageName("");
+                            }}
+                            className="space-y-2"
+                          >
+                            <label
+                              htmlFor="tome-new-page-input"
+                              className="text-[11px] font-semibold text-foreground"
+                            >
+                              New page path
+                            </label>
+                            <Input
+                              id="tome-new-page-input"
+                              ref={newPageInputRef}
+                              value={newPageName}
+                              onChange={(e) => setNewPageName(e.target.value)}
+                              onKeyDown={(e) => {
+                                if (e.key === "Escape") {
+                                  e.preventDefault();
+                                  setNewPageOpen(false);
+                                  setNewPageName("");
+                                }
+                              }}
+                              placeholder="objectives/q3.md"
+                              className="h-8 font-mono text-xs"
+                              aria-label="New page path"
+                            />
+                            <p className="text-[10px] leading-snug text-muted-foreground">
+                              Use <span className="font-mono">/</span> to nest into folders, e.g.{" "}
+                              <span className="font-mono">objectives/q3.md</span>.
+                            </p>
+                            <div className="flex items-center justify-between gap-2 pt-1">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setNewPageOpen(false);
+                                  setNewPageName("");
+                                  uploadInputRef.current?.click();
+                                }}
+                                className="inline-flex items-center gap-1 rounded px-2 py-1 text-[11px] text-muted-foreground hover:text-foreground"
+                              >
+                                <Upload className="h-3.5 w-3.5" />
+                                Upload instead
+                              </button>
+                              <Button type="submit" size="sm" className="h-7 px-2.5 text-[11px]" disabled={!newPageName.trim()}>
+                                Create
+                              </Button>
+                            </div>
+                          </form>
+                        </PopoverContent>
+                      </Popover>
+                    )}
+                  </div>
                 </div>
+
+                <input
+                  ref={uploadInputRef}
+                  type="file"
+                  accept=".md,.mdx,text/markdown"
+                  multiple
+                  className="hidden"
+                  onChange={(e) => {
+                    const files = e.target.files;
+                    if (files && files.length > 0) void uploadPages(files);
+                    e.target.value = "";
+                  }}
+                />
 
                 {loading ? (
                   <SidebarSkeleton />
@@ -207,6 +401,7 @@ export function TomeWiki({ slug }: { slug: string }) {
                       selectedPath={navActive.page}
                       onSelect={openPage}
                       showHidden={showHidden}
+                      onDelete={deletePage}
                     />
                   )
                 )}

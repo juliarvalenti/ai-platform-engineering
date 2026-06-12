@@ -17,12 +17,22 @@ export interface ProjectOnboardingStepConfig {
    *  - `http`: POST the project to an external system at `endpoint`
    *  - `link`: no backend call — just record an app-tile deep link (`appUrl`)
    *    for a first-party/in-process app (e.g. an in-app feature route)
+   *  - `source`: a pre-create metadata step — a live-fetch picker that attaches
+   *    the project's sources (repos / spaces) from a connected provider. Which
+   *    connector it picks is set by `source` (e.g. `github`, `confluence`).
+   *    These steps run BEFORE the project is created, so their selections feed
+   *    the create payload (and any later `http` steps' `${project.repos}`).
    *  - `none`/unset: no-op (skipped)
    * The external system is named/located entirely via `endpoint`/`appUrl`
    * (which may reference `${ENV_VAR}`), so no product-specific provider is
    * hardcoded in this repo.
    */
-  provider?: "mock" | "none" | "http" | "link";
+  provider?: "mock" | "none" | "http" | "link" | "source";
+  /**
+   * `source` provider: which connector this step attaches. Each renders its own
+   * live-fetch picker UX. Selections populate the project's sources at create.
+   */
+  source?: "github" | "confluence" | "webex";
   /** http provider: target URL; supports `${ENV_VAR}` interpolation. */
   endpoint?: string;
   /** http provider: deep-link recorded as `<id>_url`; supports `${ENV_VAR}`. */
@@ -133,7 +143,13 @@ function normalizeConfig(raw: unknown): ProjectOnboardingConfig {
               ? "http"
               : s.provider === "link"
                 ? "link"
-                : "none",
+                : s.provider === "source"
+                  ? "source"
+                  : "none",
+        source:
+          s.source === "github" || s.source === "confluence" || s.source === "webex"
+            ? s.source
+            : undefined,
         endpoint: typeof s.endpoint === "string" ? s.endpoint : undefined,
         appUrl: typeof s.appUrl === "string" ? s.appUrl : undefined,
         body:
