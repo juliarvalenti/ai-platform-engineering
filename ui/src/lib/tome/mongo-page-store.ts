@@ -8,6 +8,8 @@
  * see PORT_PLAN.md §G).
  */
 
+import { ObjectId } from "mongodb";
+
 import { getTomePageRevisionsCollection } from "./mongo-collections";
 import { safePagePath, type PageStore, type WritePageOpts } from "./page-store";
 import type { PageRevision } from "@/types/tome";
@@ -100,6 +102,18 @@ export class MongoPageStore implements PageStore {
       .find({ project_id: projectId, path: safe })
       .sort({ created_at: -1, _id: -1 })
       .toArray();
+  }
+
+  async readRevision(
+    projectId: string,
+    revisionId: string,
+  ): Promise<PageRevision | null> {
+    const col = await getTomePageRevisionsCollection();
+    // Revisions are stored with auto ObjectId ids; accept the hex string.
+    const idFilter = ObjectId.isValid(revisionId)
+      ? (new ObjectId(revisionId) as unknown as string)
+      : revisionId;
+    return col.findOne({ _id: idFilter, project_id: projectId });
   }
 }
 

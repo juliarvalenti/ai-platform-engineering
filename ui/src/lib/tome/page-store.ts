@@ -58,6 +58,12 @@ export interface PageStore {
   /** All revisions of a page, newest first. */
   pageHistory(projectId: string, path: string): Promise<PageRevision[]>;
 
+  /** A single revision by id (with its body), or null if not found. */
+  readRevision(
+    projectId: string,
+    revisionId: string,
+  ): Promise<PageRevision | null>;
+
   /**
    * Presigned read URL for large bodies (s3 backend). Returns null for
    * backends that inline bodies (mongo) — caller falls back to readPage.

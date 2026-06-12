@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ChevronDown, X } from "lucide-react";
+import { ChevronDown, History, X } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -37,6 +37,8 @@ interface Props {
   onReload: () => void | Promise<void>;
   /** When provided, renders a close (×) button — used by the artifact pane. */
   onClose?: () => void;
+  /** When provided, renders a History button opening the revision diff view. */
+  onOpenHistory?: () => void;
 }
 
 /**
@@ -54,6 +56,7 @@ export function WikiPageView({
   onWrite,
   onReload,
   onClose,
+  onOpenHistory,
 }: Props) {
   const [isEditing, setIsEditing] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -141,6 +144,17 @@ export function WikiPageView({
           {path}
         </span>
         <div className="ml-auto flex items-center gap-2">
+          {onOpenHistory && !isEditing && (
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={onOpenHistory}
+              title="Revision history & diffs"
+            >
+              <History className="h-4 w-4" />
+              History
+            </Button>
+          )}
           <KindToggle currentKind={kind} onChange={handleChangeKind} />
           {isEditing ? (
             <>

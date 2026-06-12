@@ -6,6 +6,7 @@ import { Loader2, Play, RefreshCw } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { ProjectAssets } from "@/components/tome/ProjectAssets";
 import { cn } from "@/lib/utils";
 
 interface RunSummary {
@@ -89,13 +90,15 @@ export function IngestPanel({
     <ScrollArea className="h-full">
       <div className="mx-auto max-w-3xl space-y-6 px-6 py-8">
         <div>
-          <h2 className="text-lg font-semibold">Ingest</h2>
+          <h2 className="text-lg font-semibold">Run ingest agent</h2>
           <p className="mt-1 text-sm text-muted-foreground">
             Re-run the agent over this project&apos;s sources to refresh the
-            dynamic wiki pages. Stable pages (charter, objectives, roadmap) are
-            preserved.
+            dynamic wiki pages. Stable pages are preserved.
           </p>
         </div>
+
+        {/* Sources the agent reads (and that scope its MCP). */}
+        <ProjectAssets slug={slug} canEdit={canEdit} />
 
         {/* Reingest control */}
         <div className="rounded-lg border p-4">

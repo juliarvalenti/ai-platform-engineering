@@ -12,6 +12,7 @@ import { WikiSidebar } from "@/components/tome/WikiSidebar";
 import { WikiPageView } from "@/components/tome/WikiPageView";
 import { IngestPanel } from "@/components/tome/IngestPanel";
 import { IngestRunView } from "@/components/tome/IngestRunView";
+import { PageHistoryView } from "@/components/tome/PageHistoryView";
 import { Breadcrumb, type Crumb } from "@/components/tome/Breadcrumb";
 import { parseFrontmatter, SPEC_BY_PATH } from "@/lib/tome/schema";
 import { cn } from "@/lib/utils";
@@ -26,6 +27,7 @@ interface PagesResponse {
 type MainView =
   | { kind: "chat" }
   | { kind: "page"; path: string }
+  | { kind: "pageHistory"; path: string }
   | { kind: "ingest" }
   | { kind: "ingestRun"; runId: string };
 
@@ -106,11 +108,23 @@ export function TomeWiki({ slug }: { slug: string }) {
         const md = data?.pages[view.path] ?? "";
         return [{ label: "Wiki" }, { label: pageTitleOf(view.path, md) }];
       }
+      case "pageHistory": {
+        const md = data?.pages[view.path] ?? "";
+        const path = view.path;
+        return [
+          { label: "Wiki" },
+          {
+            label: pageTitleOf(path, md),
+            onClick: () => setView({ kind: "page", path }),
+          },
+          { label: "History" },
+        ];
+      }
       case "ingest":
-        return [{ label: "Ingest" }];
+        return [{ label: "Run ingest agent" }];
       case "ingestRun":
         return [
-          { label: "Ingest", onClick: () => setView({ kind: "ingest" }) },
+          { label: "Run ingest agent", onClick: () => setView({ kind: "ingest" }) },
           { label: "Run" },
         ];
     }
@@ -119,7 +133,8 @@ export function TomeWiki({ slug }: { slug: string }) {
   const navActive = {
     chat: view.kind === "chat",
     ingest: view.kind === "ingest" || view.kind === "ingestRun",
-    page: view.kind === "page" ? view.path : null,
+    page:
+      view.kind === "page" || view.kind === "pageHistory" ? view.path : null,
   };
 
   return (
@@ -155,7 +170,7 @@ export function TomeWiki({ slug }: { slug: string }) {
                 />
                 <NavItem
                   icon={<RefreshCw className="h-4 w-4" />}
-                  label="Ingest"
+                  label="Run ingest agent"
                   active={navActive.ingest}
                   onClick={() => setView({ kind: "ingest" })}
                 />
@@ -236,6 +251,10 @@ export function TomeWiki({ slug }: { slug: string }) {
               <div className="min-w-0 flex-1">
                 <IngestRunView slug={slug} runId={view.runId} onPagesChanged={load} />
               </div>
+            ) : view.kind === "pageHistory" ? (
+              <div className="min-w-0 flex-1">
+                <PageHistoryView slug={slug} path={view.path} />
+              </div>
             ) : (
               // page
               <div className="min-w-0 flex-1">
@@ -248,6 +267,9 @@ export function TomeWiki({ slug }: { slug: string }) {
                     markdown={data.pages[view.path]}
                     onWrite={writeMarkdown}
                     onReload={load}
+                    onOpenHistory={() =>
+                      setView({ kind: "pageHistory", path: view.path })
+                    }
                   />
                 ) : (
                   <p className="p-8 text-sm text-muted-foreground">Page not found.</p>

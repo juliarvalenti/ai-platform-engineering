@@ -1022,6 +1022,16 @@ pre code.hljs {
   color: hsl(var(--foreground));
 }
 
+/* The global `*:focus-visible` rule applies a Tailwind box-shadow ring to
+   every focusable element — including the contenteditable surface, which then
+   shows an unwanted light-blue ring on click. The caret (and the amber
+   edit-mode frame on the wrapper) already signal focus, so suppress it here. */
+.milkdown-host .milkdown .ProseMirror:focus,
+.milkdown-host .milkdown .ProseMirror:focus-visible {
+  outline: none;
+  box-shadow: none;
+}
+
 /* Citation chips: github issue/pr/commit/release/mention links rendered by
    the linkAttr hook get `md-citation md-citation-<kind>`. Inline pill styling. */
 .milkdown-host .md-citation {
