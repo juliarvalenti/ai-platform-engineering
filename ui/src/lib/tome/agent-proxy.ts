@@ -43,6 +43,16 @@ export interface AgentChatRequest {
   role: "viewer" | "editor";
 }
 
+/** IngestRequest — mirrors contract.IngestRequest. */
+export interface AgentIngestRequest {
+  run_id: string;
+  seed: string | null;
+  connector_data: Record<string, unknown>;
+  snapshot: ProjectSnapshot;
+  is_greenfield: boolean;
+  report_id: string;
+}
+
 /** Derive a short slug from a repo URL or `owner/name` string. */
 function repoSlug(repo: string): string {
   const trimmed = repo.replace(/\.git$/, "").replace(/\/$/, "");
@@ -103,5 +113,26 @@ export async function buildChatRequest(
     snapshot: buildSnapshot(ctx),
     stable_pages: await loadStablePages(ctx.projectId),
     role: ctx.canEdit ? "editor" : "viewer",
+  };
+}
+
+/** Assemble the agent `IngestRequest` for one ingest run. */
+export function buildIngestRequest(
+  ctx: TomeProjectContext,
+  opts: {
+    runId: string;
+    reportId: string;
+    seed: string | null;
+    isGreenfield: boolean;
+    connectorData?: Record<string, unknown>;
+  },
+): AgentIngestRequest {
+  return {
+    run_id: opts.runId,
+    report_id: opts.reportId,
+    seed: opts.seed,
+    connector_data: opts.connectorData ?? {},
+    snapshot: buildSnapshot(ctx),
+    is_greenfield: opts.isGreenfield,
   };
 }

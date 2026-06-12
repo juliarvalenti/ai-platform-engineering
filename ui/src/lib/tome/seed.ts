@@ -52,7 +52,7 @@ export function buildGreenfieldPages(
  * charter's first `## What we're building` heading, replacing the italic
  * prompt line beneath it.
  */
-function injectCharterIntro(charterMd: string, description: string): string {
+export function injectCharterIntro(charterMd: string, description: string): string {
   const heading = "## What we're building";
   const idx = charterMd.indexOf(heading);
   if (idx === -1) return charterMd;
