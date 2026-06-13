@@ -1020,6 +1020,14 @@ pre code.hljs {
 .milkdown-host .milkdown {
   min-height: 100%;
   background: transparent;
+  /* Crepe re-declares its theme vars ON `.milkdown` (e.g.
+     `--crepe-color-primary: #333`), which shadows the mapping we set on the
+     parent `.milkdown-host`. Re-map the consumed ones here, at matching
+     specificity, so links/accents pick up the app theme (not near-black). */
+  --crepe-color-primary: hsl(var(--primary));
+  --crepe-color-on-primary: hsl(var(--primary-foreground));
+  --crepe-color-on-background: hsl(var(--foreground));
+  --crepe-color-selected: hsl(var(--accent));
 }
 
 .milkdown-host .milkdown .ProseMirror {
@@ -1046,6 +1054,15 @@ pre code.hljs {
 .milkdown-host .milkdown .ProseMirror :not(pre) > code {
   @apply bg-muted px-1.5 py-0.5 rounded text-sm font-mono;
   color: hsl(var(--foreground));
+}
+
+/* Links: Crepe's default resolves to a near-black that's invisible in dark
+   mode (black-on-black). Use the app's link color, like `.prose a`. The
+   citation-chip links below opt out (they carry their own pill styling). */
+.milkdown-host .milkdown .ProseMirror a:not(.md-citation) {
+  color: hsl(var(--primary));
+  text-decoration: underline;
+  text-underline-offset: 2px;
 }
 
 /* Citation chips: github issue/pr/commit/release/mention links rendered by
