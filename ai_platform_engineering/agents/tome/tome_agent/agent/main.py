@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -32,8 +33,10 @@ import httpx
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import PlainTextResponse, StreamingResponse
 
+from tome_agent.agent import http_client
 from tome_agent.agent.chat import stream_chat
 from tome_agent.agent.ingestor import stream_ingest
+from tome_agent.agent.loop import project_root
 from tome_agent.config import settings
 from tome_agent.orchestrator.contract import (
     ChatEventPayload,
@@ -127,6 +130,16 @@ def metrics() -> str:
 # ---------- chat ----------
 
 
+def _yank_working_copy(project_id: str) -> None:
+    """Remove this project's scratch working copy after a run. It's rehydrated
+    from the backend (source of truth) at the next run, so nothing is lost —
+    this just keeps one project's files from lingering in the shared container."""
+    try:
+        shutil.rmtree(project_root(project_id), ignore_errors=True)
+    except Exception:
+        log.warning("failed to remove working copy for %s", project_id, exc_info=True)
+
+
 def _sse_format(event: ChatEventPayload | IngestEventPayload) -> bytes:
     """Render a typed event as SSE wire format. The `event:` line carries
     the payload type so the backend's proxy can dispatch without parsing
@@ -141,6 +154,9 @@ async def chat_endpoint(body: ChatRequest):
         raise HTTPException(503, "agent not ready")
 
     async def gen() -> AsyncIterator[bytes]:
+        # Scope every backend callback in this run to the request's project
+        # (set inside the generator so awaited stream_* calls inherit it).
+        http_client.set_active_project_id(body.snapshot.project_id)
         _state.in_flight_runs += 1
         _state.last_activity_at = datetime.now(timezone.utc)
         try:
@@ -154,6 +170,7 @@ async def chat_endpoint(body: ChatRequest):
         finally:
             _state.in_flight_runs = max(0, _state.in_flight_runs - 1)
             _state.last_activity_at = datetime.now(timezone.utc)
+            _yank_working_copy(body.snapshot.project_id)
 
     return StreamingResponse(gen(), media_type="text/event-stream")
 
@@ -167,6 +184,9 @@ async def ingest_endpoint(body: IngestRequest):
         raise HTTPException(503, "agent not ready")
 
     async def gen() -> AsyncIterator[bytes]:
+        # Scope every backend callback in this run to the request's project
+        # (set inside the generator so awaited stream_* calls inherit it).
+        http_client.set_active_project_id(body.snapshot.project_id)
         _state.in_flight_runs += 1
         _state.last_activity_at = datetime.now(timezone.utc)
         try:
@@ -182,5 +202,6 @@ async def ingest_endpoint(body: IngestRequest):
         finally:
             _state.in_flight_runs = max(0, _state.in_flight_runs - 1)
             _state.last_activity_at = datetime.now(timezone.utc)
+            _yank_working_copy(body.snapshot.project_id)
 
     return StreamingResponse(gen(), media_type="text/event-stream")

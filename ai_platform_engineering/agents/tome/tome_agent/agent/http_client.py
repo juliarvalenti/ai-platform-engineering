@@ -17,6 +17,7 @@ log.
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import os
 from collections.abc import AsyncIterator
@@ -46,12 +47,34 @@ def _auth_headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 
+# The container is multi-project: each request scopes itself to the project in
+# its snapshot. The active id is set per-request (set_active_project_id) and read
+# here; the env var is only a single-project fallback. ContextVars are
+# task-local, so concurrent requests for different projects can't clobber each
+# other. Callbacks that MUST hit the right project (page writes/reads) also take
+# an explicit `project_id` override, in case the SDK runs a hook outside this
+# context.
+_active_project_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "tome_active_project_id", default=None
+)
+
+
+def set_active_project_id(project_id: str) -> None:
+    """Scope this request's backend callbacks to `project_id`."""
+    _active_project_id.set(project_id)
+
+
 def _project_id() -> str:
     # CAIPE project ids are Mongo ObjectId hex / slugs, not UUIDs. Treat as
     # an opaque string used only to build callback URLs.
+    active = _active_project_id.get()
+    if active:
+        return active
     raw = os.environ.get("TTT_PROJECT_ID")
     if not raw:
-        raise RuntimeError("TTT_PROJECT_ID env var not set")
+        raise RuntimeError(
+            "no active project id (set_active_project_id) and TTT_PROJECT_ID unset"
+        )
     return raw
 
 
@@ -89,8 +112,9 @@ async def write_page(
     message: str,
     author: str,
     report_id: UUID | None = None,
+    project_id: str | None = None,
 ) -> None:
-    pid = _project_id()
+    pid = project_id or _project_id()
     url = f"{_backend_url()}/api/internal/projects/{pid}/pages"
     payload = WritePageRequest(
         path=page_path,
@@ -128,12 +152,13 @@ async def append_log(run_id: UUID, line: str) -> None:
 
 # ---------- sync wrappers for SDK PostToolUse hooks ----------
 
-def fetch_all_pages_sync() -> dict[str, str]:
+def fetch_all_pages_sync(project_id: str | None = None) -> dict[str, str]:
     """All current pages as `{path: markdown}` from the backend. Used to
     rehydrate the agent's `/project` working copy at the start of a run so
     its filesystem tools (Read/Glob/Grep) never see stale content. Sync so it
     can run inside the sync `build_agent_options` factory."""
-    url = f"{_backend_url()}/api/internal/projects/{_project_id()}/pages"
+    pid = project_id or _project_id()
+    url = f"{_backend_url()}/api/internal/projects/{pid}/pages"
     with httpx.Client(timeout=DEFAULT_TIMEOUT) as client:
         resp = client.get(url, headers=_auth_headers())
         resp.raise_for_status()

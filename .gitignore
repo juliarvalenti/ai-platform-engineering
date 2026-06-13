@@ -331,3 +331,6 @@ COMMIT_BODY.md
 
 # GitHub App credentials (never commit)
 .github-apps-credentials/
+
+# Local tome-agent dev launcher (contains internal dev URLs)
+ai_platform_engineering/agents/tome/run-agent.local.sh

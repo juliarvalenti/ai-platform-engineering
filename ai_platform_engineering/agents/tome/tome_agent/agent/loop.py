@@ -32,21 +32,28 @@ WIKI_TOOLS = ["Read", "Edit", "Write", "Glob", "Grep"]
 WEB_TOOLS = ["WebFetch", "WebSearch"]
 
 
-def project_root() -> Path:
-    """The wiki dir mounted into the agent container. Backend bind-mounts
-    `data/wiki/{project_id}` here at start."""
+def project_base() -> Path:
+    """Base dir for per-project working copies inside the (multi-project)
+    container. `TTT_PROJECT_ROOT` is now the BASE, not a single project's dir."""
     return Path(os.environ.get("TTT_PROJECT_ROOT", "/project"))
 
 
-def _rehydrate_project(pdir: Path) -> None:
-    """Refresh the `/project` working copy from the backend (source of truth)
+def project_root(project_id: str) -> Path:
+    """This request's wiki working copy: `<base>/<project_id>`. Scoping the dir
+    to the request's project is what keeps one project's ingest from writing
+    into another's (the cause of the cfn→tome-smoke bug)."""
+    return project_base() / project_id
+
+
+def _rehydrate_project(pdir: Path, project_id: str) -> None:
+    """Refresh the project working copy from the backend (source of truth)
     at the start of each run, so the agent's Read/Glob/Grep tools never see
     stale content after UI edits or prior-turn agent writes. Best-effort: on
     failure we keep whatever is already on disk."""
     try:
-        pages = http_client.fetch_all_pages_sync()
+        pages = http_client.fetch_all_pages_sync(project_id=project_id)
     except Exception:
-        log.warning("project rehydrate failed; using existing /project", exc_info=True)
+        log.warning("project rehydrate failed; using existing working copy", exc_info=True)
         return
     for path, md in pages.items():
         try:
@@ -177,15 +184,22 @@ def make_persist_hook(
     *,
     author: str,
     report_id: UUID | None,
+    project_dir: Path,
+    project_id: str,
     on_write: Callable[[str, int], Any] | None = None,
 ):
     """PostToolUse hook that POSTs every Edit/Write of a file under
-    `project_root()` to `ttt-backend/internal/projects/{id}/pages`.
+    `project_dir` to `ttt-backend/internal/projects/{project_id}/pages`.
+
+    `project_dir`/`project_id` are captured at build time (when this request's
+    project scope is known) and passed explicitly to the backend write, so a
+    write can never be misrouted to another project even if the SDK runs the
+    hook outside the request's context.
 
     `report_id` tags the revision with the ingest run's Report (None for
     chat edits). `on_write(page_path, byte_count)` runs after a
     successful POST — the ingest agent uses it to emit a log SSE event."""
-    pdir = project_root().resolve()
+    pdir = project_dir.resolve()
 
     async def persist(input_data, _tool_use_id, _context):
         tool_name = input_data.get("tool_name", "")
@@ -212,6 +226,7 @@ def make_persist_hook(
                 message=f"{author}: {page_path}",
                 author=author,
                 report_id=report_id,
+                project_id=project_id,
             )
             log.info("agent persisted %s (report_id=%s)", page_path, report_id)
             if on_write is not None:
@@ -298,9 +313,15 @@ def build_agent_options(
 
     agent_role = os.environ.get("TTT_AGENT_ROLE", "editor")
 
-    pdir = project_root()
+    # Scope this run to the request's project: a per-project working dir and
+    # backend callbacks keyed by the same id. Without this the container's env
+    # `TTT_PROJECT_ID` would route every project's writes to one project.
+    project_id = snapshot.project_id
+    http_client.set_active_project_id(project_id)
+
+    pdir = project_root(project_id)
     pdir.mkdir(parents=True, exist_ok=True)
-    _rehydrate_project(pdir)
+    _rehydrate_project(pdir, project_id)
 
     mcp_servers: dict = {}
     # Viewer containers have no write tools — Edit and Write are excluded
@@ -376,6 +397,8 @@ def build_agent_options(
                         make_persist_hook(
                             author=persist_author,
                             report_id=report_id,
+                            project_dir=pdir,
+                            project_id=project_id,
                             on_write=on_write,
                         )
                     ],
