@@ -4,21 +4,17 @@
 
 import { AnimatePresence, motion } from "framer-motion";
 import {
-  BookOpen,
-  Bot,
+  Boxes,
+  Check,
   CheckCircle2,
   ChevronDown,
   FolderKanban,
   ListChecks,
   Loader2,
-  MessageSquare,
   Rocket,
   Search,
-  Sparkles,
-  Video,
   type LucideIcon,
 } from "lucide-react";
-import Link from "next/link";
 import {
   useCallback,
   useEffect,
@@ -44,6 +40,13 @@ interface OnboardingStepConfig {
   checklist?: string[];
   provider?: "mock" | "none" | "http" | "link" | "source";
   source?: SourceKind;
+  /** Whether this integration starts enabled in the Integrations step. */
+  default_enabled?: boolean;
+}
+
+/** Sources are pickers; everything else is a provisionable "app" integration. */
+function isSourceStep(s: OnboardingStepConfig): boolean {
+  return s.provider === "source";
 }
 
 interface WizardStepMeta {
@@ -53,29 +56,16 @@ interface WizardStepMeta {
   icon: LucideIcon;
   gradient: string;
   checklist?: string[];
-  /** create = name/team; source = a pre-create source picker; review = confirm + commit; provision = http/link/mock; complete = success. */
-  kind: "create" | "source" | "review" | "provision" | "complete";
+  /** create = name/team; integrations = enable + configure apps/sources; review = confirm + commit (terminal — navigates to the project). */
+  kind: "create" | "integrations" | "review";
   source?: SourceKind;
 }
 
-const ICONS: Record<string, LucideIcon> = {
-  sparkles: Sparkles,
-  "book-open": BookOpen,
-  video: Video,
-  "message-square": MessageSquare,
-  bot: Bot,
-  "folder-kanban": FolderKanban,
-  rocket: Rocket,
-};
-
 const DEFAULT_GRADIENT = "from-violet-600 via-indigo-600 to-blue-600";
 
-function resolveIcon(name?: string): LucideIcon {
-  if (!name) return Sparkles;
-  return ICONS[name] ?? Sparkles;
-}
-
-function buildWizardSteps(configSteps: OnboardingStepConfig[]): WizardStepMeta[] {
+function buildWizardSteps(
+  configSteps: OnboardingStepConfig[],
+): WizardStepMeta[] {
   const create: WizardStepMeta = {
     id: "create",
     title: "Create Project",
@@ -84,26 +74,20 @@ function buildWizardSteps(configSteps: OnboardingStepConfig[]): WizardStepMeta[]
     gradient: DEFAULT_GRADIENT,
     kind: "create",
   };
-  const toMeta = (step: OnboardingStepConfig, kind: "source" | "provision"): WizardStepMeta => ({
-    id: step.id,
-    title: step.title,
-    subtitle: step.subtitle,
-    icon: resolveIcon(step.icon),
-    gradient: step.gradient ?? DEFAULT_GRADIENT,
-    checklist: step.checklist,
-    kind,
-    source: step.source,
-  });
-  // Source steps are pre-create (they feed the create payload), so they always
-  // precede the provision steps regardless of YAML order.
-  const sourceSteps = configSteps
-    .filter((s) => s.provider === "source")
-    .map((s) => toMeta(s, "source"));
-  const provisionSteps = configSteps
-    .filter((s) => s.provider !== "source")
-    .map((s) => toMeta(s, "provision"));
-  // The project is committed on the review step (provision steps POST against
-  // its id), so review sits after sources and before provisioning.
+  // Every configured integration (source or app) lives in one Integrations step
+  // where the user enables the ones they want and fills in any details.
+  const integrations: WizardStepMeta | null = configSteps.length
+    ? {
+        id: "integrations",
+        title: "Integrations",
+        subtitle: "Enable the apps and sources for this project",
+        icon: Boxes,
+        gradient: DEFAULT_GRADIENT,
+        kind: "integrations",
+      }
+    : null;
+  // Review is the terminal step: clicking Create commits the project, provisions
+  // the enabled apps in the background, and lands the user on the project page.
   const review: WizardStepMeta = {
     id: "review",
     title: "Review & Create",
@@ -112,22 +96,9 @@ function buildWizardSteps(configSteps: OnboardingStepConfig[]): WizardStepMeta[]
     gradient: DEFAULT_GRADIENT,
     kind: "review",
   };
-  const complete: WizardStepMeta = {
-    id: "complete",
-    title: "Done",
-    subtitle: "Your project is ready",
-    icon: Rocket,
-    gradient: "from-emerald-600 via-green-600 to-teal-600",
-    kind: "complete",
-  };
-  return [create, ...sourceSteps, review, ...provisionSteps, complete];
-}
-
-interface StepRunState {
-  phase: "idle" | "calling" | "done" | "failed";
-  statusMessage?: string;
-  mockRef?: string;
-  error?: string;
+  return [create, integrations, review].filter(
+    (s): s is WizardStepMeta => Boolean(s),
+  );
 }
 
 export function ProjectOnboardingWizard({
@@ -139,6 +110,9 @@ export function ProjectOnboardingWizard({
 }) {
   const [open, setOpen] = useState(initialOpen);
   const [configSteps, setConfigSteps] = useState<OnboardingStepConfig[]>([]);
+  // Which integrations the user has enabled (id → on), seeded from the config's
+  // `default_enabled`. Drives the Integrations step + which apps provision.
+  const [enabled, setEnabled] = useState<Record<string, boolean>>({});
   const [phaseIndex, setPhaseIndex] = useState(0);
   const [projectName, setProjectName] = useState("");
   const [description, setDescription] = useState("");
@@ -169,37 +143,19 @@ export function ProjectOnboardingWizard({
     swimlanes: [],
   });
   const [teams, setTeams] = useState<TeamPickerOption[]>([]);
-  const [project, setProject] = useState<ProjectDocument | null>(null);
+  const [teamsLoading, setTeamsLoading] = useState(true);
   const [provisioning, setProvisioning] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [stepRuns, setStepRuns] = useState<Record<string, StepRunState>>({});
-  const stepRunLock = useRef<string | null>(null);
 
-  const wizardSteps = useMemo(() => buildWizardSteps(configSteps), [configSteps]);
+  const wizardSteps = useMemo(
+    () => buildWizardSteps(configSteps),
+    [configSteps],
+  );
   const phase = wizardSteps[phaseIndex] ?? wizardSteps[0];
-  const completeIndex = wizardSteps.length - 1;
-  const sourceStepCount = useMemo(
-    () => wizardSteps.filter((s) => s.kind === "source").length,
-    [wizardSteps],
-  );
-  const hasProvisionSteps = useMemo(
-    () => wizardSteps.some((s) => s.kind === "provision"),
-    [wizardSteps],
-  );
-  // Layout: create=0, source steps occupy 1..sourceStepCount, then the review
-  // step (where the project is committed), then provision steps, then complete.
-  const reviewIndex = 1 + sourceStepCount;
-  const firstProvisionIndex = reviewIndex + 1;
-  const isSourcePhase = phase.kind === "source";
+  // Flow: create=0, [integrations], review. Review is terminal — Create commits,
+  // provisions enabled apps in the background, and navigates to the project.
+  const isIntegrationsPhase = phase.kind === "integrations";
   const isReviewPhase = phase.kind === "review";
-  const isProvisionPhase = phase.kind === "provision";
-  const currentStepRun = isProvisionPhase ? stepRuns[phase.id] : undefined;
-  const currentStepDone =
-    project?.onboarding?.[phase.id]?.status === "completed" ||
-    currentStepRun?.phase === "done";
-  const currentStepFailed =
-    project?.onboarding?.[phase.id]?.status === "failed" ||
-    currentStepRun?.phase === "failed";
 
   // Backstage lookup: debounced search of existing Systems.
   const lookupBackstage = useCallback((q: string) => {
@@ -243,9 +199,18 @@ export function ProjectOnboardingWizard({
     fetch("/api/projects/onboarding-config")
       .then((res) => res.json())
       .then((body) => {
-        setConfigSteps((body.data?.config?.steps ?? []) as OnboardingStepConfig[]);
+        const steps = (body.data?.config?.steps ?? []) as OnboardingStepConfig[];
+        setConfigSteps(steps);
+        setEnabled(
+          Object.fromEntries(
+            steps.map((s) => [s.id, Boolean(s.default_enabled)]),
+          ),
+        );
       })
-      .catch(() => setConfigSteps([]));
+      .catch(() => {
+        setConfigSteps([]);
+        setEnabled({});
+      });
 
     // Existing label values → datalist suggestions for BHAG / Swim Lane.
     fetch("/api/projects/facets")
@@ -284,7 +249,8 @@ export function ProjectOnboardingWizard({
           })),
         );
       })
-      .catch(() => setTeams([]));
+      .catch(() => setTeams([]))
+      .finally(() => setTeamsLoading(false));
   }, [open]);
 
   const reset = useCallback(() => {
@@ -294,11 +260,8 @@ export function ProjectOnboardingWizard({
     setTeamId("");
     setInitiativesRaw("");
     setSwimlanesRaw("");
-    setProject(null);
     setProvisioning(false);
     setError(null);
-    setStepRuns({});
-    stepRunLock.current = null;
   }, []);
 
   const close = useCallback(() => {
@@ -306,103 +269,21 @@ export function ProjectOnboardingWizard({
     reset();
   }, [reset]);
 
-  const runSingleStep = useCallback(
-    async (stepId: string) => {
-      if (!project?._id) return;
-      const existing = project.onboarding?.[stepId]?.status;
-      if (existing === "completed" || stepRunLock.current === stepId) {
-        return;
-      }
-
-      stepRunLock.current = stepId;
-      setError(null);
-      setProvisioning(true);
-      setStepRuns((prev) => ({
-        ...prev,
-        [stepId]: { phase: "calling" },
-      }));
-
-      try {
-        const res = await fetch("/api/projects/onboard", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ project_id: project._id, steps: [stepId] }),
-        });
-        const body = await res.json();
-        if (!res.ok) {
-          throw new Error(body.error ?? body.message ?? "Onboarding failed");
-        }
-
-        const updated = body.data?.project as ProjectDocument;
-        const result = (
-          body.data?.results as Array<{
-            step: string;
-            status: string;
-            mock_ref?: string;
-            status_message?: string;
-            error?: string;
-          }>
-        )?.find((entry) => entry.step === stepId);
-
-        if (updated) {
-          setProject(updated);
-        }
-
-        if (result?.status === "failed") {
-          setStepRuns((prev) => ({
-            ...prev,
-            [stepId]: {
-              phase: "failed",
-              error: result.error ?? "Provisioning failed",
-            },
-          }));
-          return;
-        }
-
-        setStepRuns((prev) => ({
-          ...prev,
-          [stepId]: {
-            phase: "done",
-            statusMessage: result?.status_message ?? "Provisioned successfully",
-            mockRef: result?.mock_ref,
-          },
-        }));
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        setError(message);
-        setStepRuns((prev) => ({
-          ...prev,
-          [stepId]: { phase: "failed", error: message },
-        }));
-      } finally {
-        stepRunLock.current = null;
-        setProvisioning(false);
-      }
-    },
-    [project],
-  );
-
-  useEffect(() => {
-    if (!open || !project?._id || !isProvisionPhase || provisioning) return;
-    const stepStatus = project.onboarding?.[phase.id]?.status;
-    if (stepStatus === "completed" || stepStatus === "failed") return;
-    const runState = stepRuns[phase.id]?.phase;
-    if (runState === "calling" || runState === "done") return;
-    void runSingleStep(phase.id);
-  }, [
-    open,
-    project?._id,
-    project?.onboarding,
-    phase.id,
-    isProvisionPhase,
-    provisioning,
-    stepRuns,
-    runSingleStep,
-  ]);
-
   async function createProject() {
     setError(null);
     setProvisioning(true);
+    // Only collect source data for sources the user actually enabled.
+    const enabledSourceKinds = new Set(
+      configSteps
+        .filter((s) => isSourceStep(s) && enabled[s.id])
+        .map((s) => s.source),
+    );
+    const github_repos = enabledSourceKinds.has("github")
+      ? githubReposRaw.split(/[\n,]/).map((s) => s.trim()).filter(Boolean)
+      : [];
+    const confluence_url = enabledSourceKinds.has("confluence")
+      ? confluenceUrl.trim() || undefined
+      : undefined;
     try {
       const res = await fetch("/api/projects", {
         method: "POST",
@@ -413,8 +294,8 @@ export function ProjectOnboardingWizard({
           team_id: teamId,
           initiatives: initiativesRaw.split(",").map((s) => s.trim()).filter(Boolean),
           swimlanes: swimlanesRaw.split(",").map((s) => s.trim()).filter(Boolean),
-          github_repos: githubReposRaw.split(/[\n,]/).map((s) => s.trim()).filter(Boolean),
-          confluence_url: confluenceUrl.trim() || undefined,
+          github_repos,
+          confluence_url,
         }),
       });
       const body = await res.json();
@@ -422,55 +303,53 @@ export function ProjectOnboardingWizard({
         throw new Error(body.error ?? body.message ?? "Failed to create project");
       }
       const created = body.data.project as ProjectDocument;
-      setProject(created);
-      if (hasProvisionSteps) {
-        setPhaseIndex(firstProvisionIndex);
-      } else {
-        setPhaseIndex(completeIndex);
-        onComplete?.(created);
+
+      // Provision the enabled app integrations (tile links, http apps) in one
+      // call — best-effort, so a provider hiccup doesn't block landing on the
+      // project. Sources were already written at create.
+      const appSteps = configSteps
+        .filter((s) => !isSourceStep(s) && enabled[s.id])
+        .map((s) => s.id);
+      if (appSteps.length > 0) {
+        try {
+          await fetch("/api/projects/onboard", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ project_id: created._id, steps: appSteps }),
+          });
+        } catch {
+          /* best-effort — the project still exists */
+        }
       }
+
+      onComplete?.(created);
+      // Land the user on the new project (keep the "Creating…" state until nav).
+      window.location.href = `/projects/${created.slug}`;
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
-    } finally {
       setProvisioning(false);
     }
   }
 
   function advanceFromCurrentStep() {
-    if (phaseIndex >= completeIndex) return;
-    const nextIndex = phaseIndex + 1;
-    setPhaseIndex(nextIndex);
-    if (nextIndex === completeIndex && project) {
-      onComplete?.(project);
-    }
+    const lastIndex = wizardSteps.length - 1;
+    if (phaseIndex >= lastIndex) return;
+    setPhaseIndex(phaseIndex + 1);
   }
 
   async function handlePrimaryAction() {
-    // Create + source steps just advance toward the review step — nothing is
-    // committed yet.
-    if (phase.kind === "create" || phase.kind === "source") {
+    // Create + integrations steps just advance toward the review step.
+    if (phase.kind === "create" || phase.kind === "integrations") {
       advanceFromCurrentStep();
       return;
     }
-    // Review is the commit: this is the only place the project is POSTed.
+    // Review is terminal: commit, provision enabled apps, navigate to the project.
     if (isReviewPhase) {
       await createProject();
-      return;
-    }
-    if (isProvisionPhase && currentStepFailed) {
-      void runSingleStep(phase.id);
-      return;
-    }
-    if (isProvisionPhase && currentStepDone) {
-      advanceFromCurrentStep();
-      return;
-    }
-    if (phase.id === "complete") {
-      close();
     }
   }
 
-  const isPreCreate = phase.kind === "create" || phase.kind === "source";
+  const isPreCreate = phase.kind === "create" || phase.kind === "integrations";
 
   const primaryLabel = isPreCreate
     ? "Continue"
@@ -478,33 +357,16 @@ export function ProjectOnboardingWizard({
       ? provisioning
         ? "Creating…"
         : "Create project"
-      : isProvisionPhase
-        ? provisioning || currentStepRun?.phase === "calling"
-          ? "Provisioning…"
-          : currentStepFailed
-            ? "Retry"
-            : currentStepDone
-              ? phaseIndex === completeIndex - 1
-                ? "Finish"
-                : "Continue"
-              : "Provision"
-        : phase.id === "complete"
-          ? "Close"
-          : "";
+      : "";
 
-  const showPrimary =
-    isPreCreate || isReviewPhase || isProvisionPhase || phase.id === "complete";
+  const showPrimary = isPreCreate || isReviewPhase;
 
   const primaryDisabled =
     provisioning ||
     // Name + team are required; enforce on the create step and again at the
     // review/commit step as a guard.
     ((phase.kind === "create" || isReviewPhase) &&
-      (!projectName.trim() || !teamId)) ||
-    (isProvisionPhase &&
-      !currentStepDone &&
-      !currentStepFailed &&
-      (currentStepRun?.phase === "calling" || provisioning));
+      (!projectName.trim() || !teamId));
 
   const stepSummary =
     configSteps.length > 0
@@ -741,18 +603,22 @@ export function ProjectOnboardingWizard({
                       BHAG · Swim Lane) power the executive dashboard.
                     </div>
                   </div>
-                  {/* Team gets its own full-width row — it's required. */}
+                  {/* Team gets its own full-width row — it's required. The label
+                      is `block` and the trigger forced to block-level `flex` so
+                      the dropdown sits on its own line under the label (the
+                      picker's default `inline-flex` otherwise shares the line). */}
                   <div className="space-y-1.5 md:col-span-2">
-                    <span className="text-sm font-medium">Team</span>
+                    <span className="block text-sm font-medium">Team</span>
                     <TeamPicker
                       options={teams}
                       value={teamId}
                       onChange={setTeamId}
                       placeholder="Select owning team"
                       hideSlugSuffix
+                      triggerClassName="flex"
                     />
-                    {teams.length === 0 && (
-                      <span className="text-xs text-muted-foreground">
+                    {!teamsLoading && teams.length === 0 && (
+                      <span className="block text-xs text-muted-foreground">
                         No teams available — ask an admin to add you to one (a
                         project must belong to a team).
                       </span>
@@ -761,29 +627,88 @@ export function ProjectOnboardingWizard({
                 </div>
               ) : null}
 
-              {isSourcePhase ? (
+              {isIntegrationsPhase ? (
                 <div className="space-y-3">
-                  <SourcePicker
-                    source={phase.source}
-                    selected={
-                      phase.source === "github"
-                        ? githubReposRaw
-                            .split(/[\n,]/)
-                            .map((s) => s.trim())
-                            .filter(Boolean)
-                        : phase.source === "confluence"
-                          ? confluenceUrl.trim()
-                            ? [confluenceUrl.trim()]
-                            : []
-                          : []
-                    }
-                    onChange={(next) => {
-                      if (phase.source === "github")
-                        setGithubReposRaw(next.join(", "));
-                      else if (phase.source === "confluence")
-                        setConfluenceUrl(next[0] ?? "");
-                    }}
-                  />
+                  {configSteps.length === 0 ? (
+                    <p className="text-sm text-muted-foreground">
+                      No integrations are configured for this deployment.
+                    </p>
+                  ) : null}
+                  {configSteps.map((step) => {
+                    const on = Boolean(enabled[step.id]);
+                    const isSource = isSourceStep(step);
+                    return (
+                      <div
+                        key={step.id}
+                        className="overflow-hidden rounded-xl border border-border/60 bg-card/30"
+                      >
+                        {/* Enable toggle — checking it progressively discloses
+                            the integration's details (a source picker, etc.). */}
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setEnabled((prev) => ({ ...prev, [step.id]: !on }))
+                          }
+                          aria-pressed={on}
+                          className="flex w-full items-center gap-3 p-4 text-left transition hover:bg-accent/30"
+                        >
+                          <span
+                            className={cn(
+                              "flex h-5 w-5 shrink-0 items-center justify-center rounded-md border transition",
+                              on
+                                ? "border-primary bg-primary text-primary-foreground"
+                                : "border-border",
+                            )}
+                          >
+                            {on ? <Check className="h-3.5 w-3.5" /> : null}
+                          </span>
+                          <span className="min-w-0 flex-1">
+                            <span className="block text-sm font-medium">
+                              {step.title}
+                            </span>
+                            <span className="block text-xs text-muted-foreground">
+                              {step.subtitle}
+                            </span>
+                          </span>
+                          <span className="shrink-0 rounded-full border border-border/60 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                            {isSource ? "source" : "app"}
+                          </span>
+                        </button>
+
+                        {on && isSource ? (
+                          <div className="border-t border-border/60 p-4">
+                            <SourcePicker
+                              source={step.source}
+                              selected={
+                                step.source === "github"
+                                  ? githubReposRaw
+                                      .split(/[\n,]/)
+                                      .map((s) => s.trim())
+                                      .filter(Boolean)
+                                  : step.source === "confluence"
+                                    ? confluenceUrl.trim()
+                                      ? [confluenceUrl.trim()]
+                                      : []
+                                    : []
+                              }
+                              onChange={(next) => {
+                                if (step.source === "github")
+                                  setGithubReposRaw(next.join(", "));
+                                else if (step.source === "confluence")
+                                  setConfluenceUrl(next[0] ?? "");
+                              }}
+                            />
+                          </div>
+                        ) : null}
+
+                        {on && !isSource ? (
+                          <div className="border-t border-border/60 px-4 py-3 text-xs text-muted-foreground">
+                            Enabled — added to this project when you create it.
+                          </div>
+                        ) : null}
+                      </div>
+                    );
+                  })}
                 </div>
               ) : null}
 
@@ -806,6 +731,17 @@ export function ProjectOnboardingWizard({
                         t.id === teamId || t._id === teamId || t.slug === teamId,
                     );
                     const teamLabel = team?.name?.trim() || team?.slug || teamId;
+                    // Only summarize what the user enabled in the Integrations step.
+                    const enabledSourceKinds = new Set(
+                      configSteps
+                        .filter((s) => isSourceStep(s) && enabled[s.id])
+                        .map((s) => s.source),
+                    );
+                    const enabledIntegrations = configSteps
+                      .filter((s) => enabled[s.id])
+                      .map((s) => s.title);
+                    const showGithub = enabledSourceKinds.has("github");
+                    const showConfluence = enabledSourceKinds.has("confluence");
                     const Row = ({
                       label,
                       children,
@@ -824,10 +760,9 @@ export function ProjectOnboardingWizard({
                     return (
                       <div className="space-y-4">
                         <p className="text-sm text-muted-foreground">
-                          Nothing has been created yet. Confirm the details below
-                          — clicking <span className="font-medium">Create project</span>{" "}
-                          commits it
-                          {hasProvisionSteps ? " and starts onboarding." : "."}
+                          Nothing has been created yet. Clicking{" "}
+                          <span className="font-medium">Create project</span>{" "}
+                          creates it and takes you to the project.
                         </p>
                         <div className="divide-y divide-border/50 rounded-xl border border-border/60 bg-muted/10">
                           <Row label="Project">
@@ -839,25 +774,34 @@ export function ProjectOnboardingWizard({
                           {description.trim() ? (
                             <Row label="Description">{description.trim()}</Row>
                           ) : null}
-                          <Row label="GitHub repos">
-                            {repos.length ? (
-                              <span className="flex flex-wrap gap-1.5">
-                                {repos.map((r) => (
-                                  <span
-                                    key={r}
-                                    className="rounded-md bg-muted px-2 py-0.5 text-xs"
-                                  >
-                                    {r.replace(/^https?:\/\/github\.com\//i, "")}
-                                  </span>
-                                ))}
-                              </span>
-                            ) : (
-                              muted
-                            )}
+                          <Row label="Integrations">
+                            {enabledIntegrations.length
+                              ? enabledIntegrations.join(", ")
+                              : muted}
                           </Row>
-                          <Row label="Confluence">
-                            {confluenceUrl.trim() || muted}
-                          </Row>
+                          {showGithub ? (
+                            <Row label="GitHub repos">
+                              {repos.length ? (
+                                <span className="flex flex-wrap gap-1.5">
+                                  {repos.map((r) => (
+                                    <span
+                                      key={r}
+                                      className="rounded-md bg-muted px-2 py-0.5 text-xs"
+                                    >
+                                      {r.replace(/^https?:\/\/github\.com\//i, "")}
+                                    </span>
+                                  ))}
+                                </span>
+                              ) : (
+                                muted
+                              )}
+                            </Row>
+                          ) : null}
+                          {showConfluence ? (
+                            <Row label="Confluence">
+                              {confluenceUrl.trim() || muted}
+                            </Row>
+                          ) : null}
                           {initiatives.length ? (
                             <Row label="BHAG / Initiatives">
                               {initiatives.join(", ")}
@@ -871,44 +815,6 @@ export function ProjectOnboardingWizard({
                     );
                   })()
                 : null}
-
-              {isProvisionPhase ? (
-                <ProvisioningCard
-                  title={phase.title}
-                  runState={currentStepRun}
-                  done={currentStepDone}
-                  failed={currentStepFailed}
-                  integrationUrl={project?.integrations?.[`${phase.id}_url`]}
-                />
-              ) : null}
-
-              {phase.id === "complete" ? (
-                <div className="space-y-6 text-center">
-                  <div className="mx-auto flex h-20 w-20 items-center justify-center rounded-full bg-emerald-500/15 text-emerald-600">
-                    <CheckCircle2 className="h-10 w-10" />
-                  </div>
-                  <div>
-                    <h3 className="text-xl font-semibold">Project ready</h3>
-                    <p className="mt-2 text-muted-foreground">
-                      {hasProvisionSteps
-                        ? "Configured onboarding steps completed."
-                        : "Your project was created. Add onboarding steps via configuration when needed."}
-                    </p>
-                  </div>
-                  {project ? (
-                    <div className="mx-auto max-w-md rounded-xl border border-border/50 bg-muted/20 p-4 text-left text-sm">
-                      <p className="font-medium">{project.title}</p>
-                      <p className="text-muted-foreground">{project.team_name}</p>
-                      <Link
-                        href={`/projects/${project.slug}`}
-                        className="mt-2 inline-block text-primary hover:underline"
-                      >
-                        Open project →
-                      </Link>
-                    </div>
-                  ) : null}
-                </div>
-              ) : null}
             </motion.div>
           </AnimatePresence>
 
@@ -921,82 +827,22 @@ export function ProjectOnboardingWizard({
 
         <div className="flex items-center justify-end border-t border-border/50 px-8 py-5">
           <div className="flex gap-3">
-            {phase.id === "complete" && project ? (
-              <Link
-                href={`/projects/${project.slug}`}
-                onClick={close}
-                className="inline-flex items-center gap-2 rounded-xl bg-primary px-5 py-2.5 text-sm font-medium text-primary-foreground shadow"
-              >
-                View project
-              </Link>
-            ) : null}
-            {showPrimary && phase.id !== "complete" ? (
+            {showPrimary ? (
               <button
                 type="button"
                 disabled={primaryDisabled}
                 onClick={() => void handlePrimaryAction()}
                 className="inline-flex items-center gap-2 rounded-xl bg-primary px-5 py-2.5 text-sm font-medium text-primary-foreground shadow transition hover:opacity-90 disabled:opacity-50"
               >
-                {(provisioning || currentStepRun?.phase === "calling") ? (
+                {provisioning ? (
                   <Loader2 className="h-4 w-4 animate-spin" />
                 ) : null}
                 {primaryLabel}
               </button>
             ) : null}
-            {phase.id === "complete" ? (
-              <button
-                type="button"
-                onClick={close}
-                className="rounded-xl border border-border px-5 py-2.5 text-sm"
-              >
-                Close
-              </button>
-            ) : null}
           </div>
         </div>
       </motion.div>
-    </div>
-  );
-}
-
-function ProvisioningCard({
-  title,
-  runState,
-  done,
-  failed,
-  integrationUrl,
-}: {
-  title: string;
-  runState?: StepRunState;
-  done: boolean;
-  failed: boolean;
-  integrationUrl?: string;
-}) {
-  return (
-    <div className="flex min-h-[180px] flex-col items-center justify-center gap-3 rounded-2xl border border-border/50 bg-gradient-to-br from-muted/40 to-muted/10 p-8 text-center">
-      {failed ? (
-        <>
-          <p className="font-semibold text-red-600">Provisioning failed</p>
-          <p className="text-sm text-muted-foreground">{runState?.error ?? "Unknown error"}</p>
-        </>
-      ) : done ? (
-        <>
-          <CheckCircle2 className="h-8 w-8 text-emerald-500" />
-          <p className="font-semibold text-emerald-600">{title} provisioned</p>
-          <p className="text-sm text-muted-foreground">
-            {runState?.statusMessage ?? "Completed successfully"}
-          </p>
-          {integrationUrl ? (
-            <p className="break-all text-xs text-primary">{integrationUrl}</p>
-          ) : null}
-        </>
-      ) : (
-        <>
-          <Loader2 className="h-8 w-8 animate-spin text-primary" />
-          <p className="text-sm font-medium">Provisioning {title}…</p>
-          <p className="text-xs text-muted-foreground">This can take a few seconds.</p>
-        </>
-      )}
     </div>
   );
 }

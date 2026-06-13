@@ -22,7 +22,7 @@ export function GithubRepoPicker({
   selected: string[];
   onChange: (next: string[]) => void;
 }) {
-  const { connected, connectedTo, options, loading, search, reload } =
+  const { connected, connectedTo, options, loading, manageUrl, search, reload } =
     useSourceOptions("github");
   const [query, setQuery] = useState("");
   const [manual, setManual] = useState("");
@@ -62,9 +62,22 @@ export function GithubRepoPicker({
           </span>
         ) : (
           <span className="text-muted-foreground">
-            GitHub not connected — link it in{" "}
-            <span className="font-medium">Settings → Connections</span> to browse
-            your repos, or paste one below.
+            {manageUrl ? (
+              <>
+                GitHub not connected — link it in{" "}
+                <a
+                  href={manageUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="font-medium text-primary underline underline-offset-2 hover:text-primary/80"
+                >
+                  Connections
+                </a>{" "}
+                to browse your repos, or paste one below.
+              </>
+            ) : (
+              "Type an org/name or paste a repo URL below."
+            )}
           </span>
         )}
         <Button variant="ghost" size="sm" onClick={reload} title="Refresh">
@@ -151,8 +164,8 @@ export function GithubRepoPicker({
       </div>
 
       <p className="text-xs text-muted-foreground">
-        {selected.length} selected · these scope the project&apos;s read-only
-        agent access.
+        {`${selected.length} selected`} · these scope the project&apos;s
+        read-only agent access.
       </p>
     </div>
   );

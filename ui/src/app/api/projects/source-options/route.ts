@@ -15,6 +15,7 @@ import {
   withErrorHandler,
 } from "@/lib/api-middleware";
 import { getProviderConnectionService } from "@/lib/credentials/oauth-service-factory";
+import { getCredentialFeatureConfig } from "@/lib/feature-flags/credentials";
 
 interface SourceOption {
   value: string;
@@ -213,8 +214,13 @@ export const GET = withErrorHandler(async (request: NextRequest) => {
   const provider = sp.get("provider")?.trim() ?? "";
   const q = sp.get("q")?.trim() ?? "";
 
+  // Only point users at the Connections page when that feature is enabled in
+  // this deployment — otherwise `/credentials` 404s, so the picker should just
+  // offer manual entry. `manageUrl` is null when there's nowhere to link.
+  const manageUrl = getCredentialFeatureConfig().enabled ? "/credentials" : null;
+
   if (!sub || (provider !== "github" && provider !== "atlassian")) {
-    return successResponse({ connected: false, options: [] });
+    return successResponse({ connected: false, options: [], manageUrl });
   }
 
   let token = "";
@@ -224,11 +230,11 @@ export const GET = withErrorHandler(async (request: NextRequest) => {
       (c) => c.provider === provider && c.status === "connected",
     );
     if (!connection) {
-      return successResponse({ connected: false, options: [] });
+      return successResponse({ connected: false, options: [], manageUrl });
     }
     token = (await service.refreshConnection(connection.id)).accessToken;
   } catch {
-    return successResponse({ connected: false, options: [] });
+    return successResponse({ connected: false, options: [], manageUrl });
   }
 
   try {
@@ -236,8 +242,8 @@ export const GET = withErrorHandler(async (request: NextRequest) => {
       provider === "github" ? githubRepos(token, q) : atlassianSpaces(token),
       connectedTo(provider, token),
     ]);
-    return successResponse({ connected: true, options, connectedTo: account });
+    return successResponse({ connected: true, options, connectedTo: account, manageUrl });
   } catch {
-    return successResponse({ connected: true, options: [], error: "provider list failed" });
+    return successResponse({ connected: true, options: [], error: "provider list failed", manageUrl });
   }
 });

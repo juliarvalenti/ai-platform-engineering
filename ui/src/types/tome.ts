@@ -109,18 +109,31 @@ export interface ChatSession {
   project_id: string;
   user_id: string;
   title?: string;
+  /** Claude Agent SDK session id — a resume hint, not the durable key. */
+  sdk_session_id?: string;
   created_at: Date;
   updated_at: Date;
 }
 
 export type ChatRole = "user" | "assistant" | "system";
 
+/**
+ * One segment of an assistant turn, in stream-arrival order — text and tool
+ * chips interleaved (mirrors ChatPanel's render model so reload is faithful).
+ */
+export type ChatPart =
+  | { kind: "text"; text: string }
+  | { kind: "tool"; label: string; path?: string };
+
 export interface ChatMessage {
   _id?: string;
   session_id: string;
   project_id: string;
   role: ChatRole;
+  /** Plain-text transcript (concatenated text parts) — always set. */
   content: string;
+  /** Interleaved render model; absent on legacy/user rows (fall back to content). */
+  parts?: ChatPart[];
   created_at: Date;
 }
 

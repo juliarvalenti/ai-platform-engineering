@@ -290,11 +290,18 @@ function provisionLink(
   step: ProjectOnboardingStepConfig,
   project: ProjectDocument,
 ): ProvisionResult {
+  const ctx = buildProjectContext(project);
   const integrations: Record<string, string> = {
     [`${step.id}_label`]: step.title,
   };
   if (step.appUrl) {
-    integrations[`${step.id}_url`] = interpolateEnv(step.appUrl);
+    // `${project.<field>}` (e.g. ${project.slug}) then `${ENV_VAR}`.
+    integrations[`${step.id}_url`] = interpolateEnv(
+      renderBodyTemplate(step.appUrl, ctx) as string,
+    );
+  }
+  if (step.appIcon) {
+    integrations[`${step.id}_icon`] = interpolateEnv(step.appIcon);
   }
   return {
     mock_ref: `link-${step.id}-${project.slug}`,

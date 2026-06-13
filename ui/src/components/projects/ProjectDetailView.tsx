@@ -24,9 +24,12 @@ import {
 } from "lucide-react";
 
 import { cn } from "@/lib/utils";
-import type { ProjectDocument } from "@/types/projects";
+import { SourcesEditor } from "@/components/projects/source-pickers/SourcesEditor";
+import { useProjectSourceKinds } from "@/components/projects/source-pickers/useProjectSourceKinds";
+import type { ProjectDocument, ProjectSources } from "@/types/projects";
 
 export function ProjectDetailView({ slug }: { slug: string }) {
+  const { kinds: sourceKinds } = useProjectSourceKinds();
   const [project, setProject] = useState<ProjectDocument | null>(null);
   const [catalogYaml, setCatalogYaml] = useState("");
   const [loading, setLoading] = useState(true);
@@ -38,8 +41,10 @@ export function ProjectDetailView({ slug }: { slug: string }) {
   const [saving, setSaving] = useState(false);
   const [editTitle, setEditTitle] = useState("");
   const [editDescription, setEditDescription] = useState("");
-  const [editRepos, setEditRepos] = useState("");
-  const [editConfluence, setEditConfluence] = useState("");
+  const [editSources, setEditSources] = useState<ProjectSources>({
+    repos: [],
+    confluence_url: "",
+  });
 
   async function confirmDelete() {
     if (!project) return;
@@ -64,8 +69,10 @@ export function ProjectDetailView({ slug }: { slug: string }) {
     if (!project) return;
     setEditTitle(project.title);
     setEditDescription(project.description ?? "");
-    setEditRepos((project.sources?.repos ?? []).join("\n"));
-    setEditConfluence(project.sources?.confluence_url ?? "");
+    setEditSources({
+      repos: project.sources?.repos ?? [],
+      confluence_url: project.sources?.confluence_url ?? "",
+    });
     setEditOpen(true);
   }
 
@@ -80,8 +87,8 @@ export function ProjectDetailView({ slug }: { slug: string }) {
           title: editTitle,
           description: editDescription,
           sources: {
-            repos: editRepos.split(/[\n,]/).map((r) => r.trim()).filter(Boolean),
-            confluence_url: editConfluence,
+            repos: (editSources.repos ?? []).map((r) => r.trim()).filter(Boolean),
+            confluence_url: (editSources.confluence_url ?? "").trim(),
           },
         }),
       });
@@ -180,10 +187,14 @@ export function ProjectDetailView({ slug }: { slug: string }) {
       const slug = key.replace(/_url$/, "");
       const url = String(value);
       const label = integrationsMap[`${slug}_label`] || humanize(slug);
+      // Optional custom image icon, config-driven like `<slug>_label`. When set
+      // (a deployment overlay value), it replaces the generic keyword icon.
+      const iconUrl = integrationsMap[`${slug}_icon`] || undefined;
       return {
         key,
         label,
         url,
+        iconUrl,
         external: /^https?:\/\//.test(url),
         // Match the keyword against slug + display label (label comes from
         // deployment config), so a "wiki" tile gets the book icon.
@@ -255,14 +266,23 @@ export function ProjectDetailView({ slug }: { slug: string }) {
               const Icon = tile.Icon;
               const inner = (
                 <>
-                  <span
-                    className={cn(
-                      "flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-gradient-to-br text-white shadow-sm",
-                      tile.gradient,
-                    )}
-                  >
-                    <Icon className="h-6 w-6" />
-                  </span>
+                  {tile.iconUrl ? (
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img
+                      src={tile.iconUrl}
+                      alt=""
+                      className="h-12 w-12 shrink-0 rounded-2xl object-cover shadow-sm"
+                    />
+                  ) : (
+                    <span
+                      className={cn(
+                        "flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-gradient-to-br text-white shadow-sm",
+                        tile.gradient,
+                      )}
+                    >
+                      <Icon className="h-6 w-6" />
+                    </span>
+                  )}
                   <span className="min-w-0 flex-1">
                     <span className="block truncate text-sm font-semibold text-foreground group-hover:text-primary">
                       {tile.label}
@@ -353,7 +373,7 @@ export function ProjectDetailView({ slug }: { slug: string }) {
 
       {editOpen ? (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
-          <div className="w-full max-w-lg rounded-2xl border border-border bg-card p-6 shadow-xl">
+          <div className="max-h-[85vh] w-full max-w-lg overflow-y-auto rounded-2xl border border-border bg-card p-6 shadow-xl">
             <h2 className="text-base font-semibold">Edit project</h2>
             <div className="mt-4 space-y-4">
               <div>
@@ -374,28 +394,18 @@ export function ProjectDetailView({ slug }: { slug: string }) {
                   className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary/40"
                 />
               </div>
-              <div>
-                <label className="mb-1 block text-xs font-medium text-muted-foreground">
-                  GitHub repos <span className="font-normal opacity-60">(one per line or comma-separated)</span>
-                </label>
-                <textarea
-                  value={editRepos}
-                  onChange={(e) => setEditRepos(e.target.value)}
-                  rows={4}
-                  placeholder="org/repo&#10;https://github.com/org/repo2"
-                  className="w-full rounded-lg border border-border bg-background px-3 py-2 font-mono text-xs focus:outline-none focus:ring-2 focus:ring-primary/40"
-                />
-              </div>
-              <div>
-                <label className="mb-1 block text-xs font-medium text-muted-foreground">Confluence URL</label>
-                <input
-                  type="url"
-                  value={editConfluence}
-                  onChange={(e) => setEditConfluence(e.target.value)}
-                  placeholder="https://company.atlassian.net/wiki/spaces/SPACE"
-                  className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary/40"
-                />
-              </div>
+              {sourceKinds.length > 0 ? (
+                <div>
+                  <label className="mb-2 block text-xs font-medium text-muted-foreground">
+                    Sources
+                  </label>
+                  <SourcesEditor
+                    kinds={sourceKinds}
+                    value={editSources}
+                    onChange={setEditSources}
+                  />
+                </div>
+              ) : null}
             </div>
             {error ? <p className="mt-3 text-sm text-red-500">{error}</p> : null}
             <div className="mt-5 flex justify-end gap-2">

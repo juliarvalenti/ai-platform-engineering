@@ -12,6 +12,8 @@ export interface SourceOptionsState {
   connectedTo?: string;
   options: SourceOption[];
   loading: boolean;
+  /** Connections page URL when that feature is enabled here, else null. */
+  manageUrl: string | null;
 }
 
 type Loaded = Omit<SourceOptionsState, "loading">;
@@ -31,6 +33,7 @@ async function loadSourceOptions(
     connected: Boolean(d.connected),
     connectedTo: typeof d.connectedTo === "string" ? d.connectedTo : undefined,
     options: Array.isArray(d.options) ? d.options : [],
+    manageUrl: typeof d.manageUrl === "string" ? d.manageUrl : null,
   };
 }
 
@@ -46,6 +49,7 @@ export function useSourceOptions(
     connected: false,
     options: [],
     loading: true,
+    manageUrl: null,
   });
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
 

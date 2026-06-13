@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowLeft,
+  ChevronRight,
   Eye,
   EyeOff,
   MessageSquare,
@@ -54,6 +55,8 @@ function pageTitleOf(path: string, markdown: string): string {
 
 export function TomeWiki({ slug }: { slug: string }) {
   const [data, setData] = useState<PagesResponse | null>(null);
+  // The project's display name for the breadcrumb (falls back to the slug).
+  const [title, setTitle] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   // Chat is the landing view; wiki + ingest live below it in the nav.
   const [view, setView] = useState<MainView>({ kind: "chat" });
@@ -81,6 +84,22 @@ export function TomeWiki({ slug }: { slug: string }) {
   useEffect(() => {
     void load();
   }, [load]);
+
+  // Project display name for the breadcrumb root.
+  useEffect(() => {
+    let cancelled = false;
+    fetch(`/api/projects/${slug}`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((body) => {
+        if (cancelled) return;
+        const t = body?.data?.project?.title;
+        if (typeof t === "string" && t) setTitle(t);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [slug]);
 
   const openPage = useCallback((path: string) => {
     setView({ kind: "page", path });
@@ -193,13 +212,12 @@ export function TomeWiki({ slug }: { slug: string }) {
         return [{ label: "Chat" }];
       case "page": {
         const md = data?.pages[view.path] ?? "";
-        return [{ label: "Wiki" }, { label: pageTitleOf(view.path, md) }];
+        return [{ label: pageTitleOf(view.path, md) }];
       }
       case "pageHistory": {
         const md = data?.pages[view.path] ?? "";
         const path = view.path;
         return [
-          { label: "Wiki" },
           {
             label: pageTitleOf(path, md),
             onClick: () => setView({ kind: "page", path }),
@@ -227,15 +245,20 @@ export function TomeWiki({ slug }: { slug: string }) {
   return (
     <TooltipProvider>
       <div className="flex h-full min-h-[calc(100vh-4rem)] flex-col">
-        <header className="flex items-center gap-3 border-b px-4 py-3">
+        <header className="flex items-center gap-1 border-b px-4 py-3 text-sm">
           <Link href={`/projects/${slug}`}>
-            <Button variant="ghost" size="sm">
+            <Button variant="ghost" size="sm" className="h-auto gap-1.5 px-2 py-1">
               <ArrowLeft className="h-4 w-4" />
-              {slug}
+              {title ?? slug}
             </Button>
           </Link>
-          <span className="text-muted-foreground">/</span>
-          <Breadcrumb items={crumbs} />
+          <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+          <Breadcrumb
+            items={[
+              { label: "tome", onClick: () => setView({ kind: "chat" }) },
+              ...crumbs,
+            ]}
+          />
         </header>
 
         {error && (
@@ -249,18 +272,20 @@ export function TomeWiki({ slug }: { slug: string }) {
           <aside className="w-64 shrink-0 border-r">
             <ScrollArea className="h-full">
               <div className="flex flex-col p-3">
-                <NavItem
-                  icon={<MessageSquare className="h-4 w-4" />}
-                  label="Chat"
-                  active={navActive.chat}
-                  onClick={() => setView({ kind: "chat" })}
-                />
-                <NavItem
-                  icon={<RefreshCw className="h-4 w-4" />}
-                  label="Run ingest agent"
-                  active={navActive.ingest}
-                  onClick={() => setView({ kind: "ingest" })}
-                />
+                <div className="flex flex-col gap-0.5">
+                  <NavItem
+                    icon={<MessageSquare className="h-4 w-4" />}
+                    label="Chat"
+                    active={navActive.chat}
+                    onClick={() => setView({ kind: "chat" })}
+                  />
+                  <NavItem
+                    icon={<RefreshCw className="h-4 w-4" />}
+                    label="Run ingest agent"
+                    active={navActive.ingest}
+                    onClick={() => setView({ kind: "ingest" })}
+                  />
+                </div>
 
                 <div className="mt-4 flex items-center justify-between gap-1 px-2 pb-1">
                   <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">

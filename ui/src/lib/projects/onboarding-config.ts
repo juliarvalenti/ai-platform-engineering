@@ -5,6 +5,8 @@ import path from "path";
 
 import yaml from "js-yaml";
 
+import { isTomeServerEnabled } from "@/lib/tome/guard";
+
 export interface ProjectOnboardingStepConfig {
   id: string;
   title: string;
@@ -35,8 +37,15 @@ export interface ProjectOnboardingStepConfig {
   source?: "github" | "confluence" | "webex";
   /** http provider: target URL; supports `${ENV_VAR}` interpolation. */
   endpoint?: string;
-  /** http provider: deep-link recorded as `<id>_url`; supports `${ENV_VAR}`. */
+  /**
+   * link/http provider: deep-link recorded as `<id>_url`. Supports `${ENV_VAR}`
+   * and (link provider) `${project.<field>}` such as `${project.slug}`.
+   */
   appUrl?: string;
+  /** link provider: optional app-tile image recorded as `<id>_icon`. */
+  appIcon?: string;
+  /** Whether this integration starts enabled in the wizard's Integrations step. */
+  default_enabled?: boolean;
   /**
    * http provider: provider connection keys (e.g. `github`, `atlassian`) whose
    * access token, for the signed-in actor, should be forwarded to the target
@@ -152,6 +161,9 @@ function normalizeConfig(raw: unknown): ProjectOnboardingConfig {
             : undefined,
         endpoint: typeof s.endpoint === "string" ? s.endpoint : undefined,
         appUrl: typeof s.appUrl === "string" ? s.appUrl : undefined,
+        appIcon: typeof s.appIcon === "string" ? s.appIcon : undefined,
+        default_enabled:
+          typeof s.default_enabled === "boolean" ? s.default_enabled : undefined,
         body:
           s.body && typeof s.body === "object" && !Array.isArray(s.body)
             ? (s.body as Record<string, unknown>)
@@ -183,10 +195,46 @@ function normalizeConfig(raw: unknown): ProjectOnboardingConfig {
   };
 }
 
+/**
+ * First-party apps that register themselves as available integrations when
+ * their feature flag is on — no deployment YAML required. Generic seam: each
+ * entry is `{ enabled, step }`; the step flows through the same wizard +
+ * provisioning path as a YAML `link` integration. (Tome is the only one today.)
+ */
+const BUILTIN_APPS: Array<{
+  enabled: () => boolean;
+  step: ProjectOnboardingStepConfig;
+}> = [
+  {
+    enabled: isTomeServerEnabled,
+    step: {
+      id: "tome",
+      title: "Tome",
+      subtitle: "A project wiki with an embedded agent",
+      icon: "book-open",
+      provider: "link",
+      appUrl: "/projects/${project.slug}/tome",
+      appIcon: "/app-icons/tome.png",
+      default_enabled: true,
+    },
+  },
+];
+
+/** Append enabled built-in apps not already present in the config. */
+function withBuiltinApps(
+  config: ProjectOnboardingConfig,
+): ProjectOnboardingConfig {
+  const extra = BUILTIN_APPS.filter(
+    (a) => a.enabled() && !config.steps.some((s) => s.id === a.step.id),
+  ).map((a) => a.step);
+  if (extra.length === 0) return config;
+  return { ...config, steps: [...config.steps, ...extra] };
+}
+
 export function loadProjectOnboardingConfig(): ProjectOnboardingConfig {
   const configPath = resolveConfigPath();
   if (!configPath) {
-    return DEFAULT_CONFIG;
+    return withBuiltinApps(DEFAULT_CONFIG);
   }
 
   try {
@@ -200,13 +248,13 @@ export function loadProjectOnboardingConfig(): ProjectOnboardingConfig {
     }
 
     const parsed = yaml.load(fs.readFileSync(configPath, "utf8"));
-    const normalized = normalizeConfig(parsed);
+    const normalized = withBuiltinApps(normalizeConfig(parsed));
     cachedConfig = normalized;
     cachedPath = configPath;
     cachedMtimeMs = stat.mtimeMs;
     return normalized;
   } catch {
-    return DEFAULT_CONFIG;
+    return withBuiltinApps(DEFAULT_CONFIG);
   }
 }
 

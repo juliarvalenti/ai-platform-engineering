@@ -1008,6 +1008,13 @@ pre code.hljs {
   --crepe-color-selected: hsl(var(--accent));
   --crepe-shadow-1: none;
   --crepe-shadow-2: none;
+  /* Crepe's title font is a serif stack (Georgia/Times) — the app has no serif
+     face, so it falls back to Times New Roman. Point every Crepe font at the
+     app's own families instead. */
+  --crepe-font-title: var(--font-sans);
+  --crepe-font-default: var(--font-sans);
+  --crepe-font-code: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    "Liberation Mono", monospace;
 }
 
 .milkdown-host .milkdown {
@@ -1030,6 +1037,15 @@ pre code.hljs {
 .milkdown-host .milkdown .ProseMirror:focus-visible {
   outline: none;
   box-shadow: none;
+}
+
+/* Inline code: Crepe's default is a hard red (rgb(186,26,26)) on a fixed grey,
+   which clashes with the app theme (and is unreadable in dark mode). Match the
+   app's prose inline-code instead — muted bg, foreground text. Scoped to inline
+   code only (`:not(pre) > code`) so CodeMirror code blocks are untouched. */
+.milkdown-host .milkdown .ProseMirror :not(pre) > code {
+  @apply bg-muted px-1.5 py-0.5 rounded text-sm font-mono;
+  color: hsl(var(--foreground));
 }
 
 /* Citation chips: github issue/pr/commit/release/mention links rendered by

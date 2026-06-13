@@ -19,7 +19,7 @@ export function ConfluenceSpacePicker({
   selected: string[];
   onChange: (next: string[]) => void;
 }) {
-  const { connected, connectedTo, options, loading, reload } =
+  const { connected, connectedTo, options, loading, manageUrl, reload } =
     useSourceOptions("atlassian");
   const [manual, setManual] = useState("");
   const current = selected[0] ?? "";
@@ -37,9 +37,22 @@ export function ConfluenceSpacePicker({
           </span>
         ) : (
           <span className="text-muted-foreground">
-            Confluence not connected — link Atlassian in{" "}
-            <span className="font-medium">Settings → Connections</span>, or paste
-            a space URL below.
+            {manageUrl ? (
+              <>
+                Confluence not connected — link Atlassian in{" "}
+                <a
+                  href={manageUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="font-medium text-primary underline underline-offset-2 hover:text-primary/80"
+                >
+                  Connections
+                </a>
+                , or paste a space URL below.
+              </>
+            ) : (
+              "Paste a Confluence space URL below."
+            )}
           </span>
         )}
         <Button variant="ghost" size="sm" onClick={reload} title="Refresh">

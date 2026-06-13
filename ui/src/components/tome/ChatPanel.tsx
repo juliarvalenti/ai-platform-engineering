@@ -7,6 +7,7 @@ import TextareaAutosize from "react-textarea-autosize";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { MarkdownRenderer } from "@/components/shared/timeline";
+import type { ChatPart as Part } from "@/types/tome";
 
 /**
  * Tome chat — the primary surface of a project's tome. Talks to the tome chat
@@ -21,14 +22,9 @@ import { MarkdownRenderer } from "@/components/shared/timeline";
 
 type Role = "user" | "assistant";
 
-/**
- * A turn is an ordered list of parts in stream-arrival order — the SDK already
- * emits text deltas and tool calls interleaved, so we just preserve that order
- * instead of flattening text into one blob and tools into a separate bucket.
- */
-type Part =
-  | { kind: "text"; text: string }
-  | { kind: "tool"; label: string; path?: string };
+// A turn is an ordered list of parts in stream-arrival order (text deltas and
+// tool calls interleaved). The shape is shared with the persistence layer as
+// `ChatPart` (@/types/tome) so a reloaded transcript re-renders faithfully.
 
 interface ChatMsg {
   role: Role;
@@ -48,13 +44,83 @@ export function ChatPanel({ slug, onPagesChanged, onOpenPage }: Props) {
   const [messages, setMessages] = useState<ChatMsg[]>([]);
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
+  const [loadingHistory, setLoadingHistory] = useState(true);
+  // sdk_session_id (agent resume hint) + tome session _id (durable transcript).
   const sessionRef = useRef<string | null>(null);
+  const sessionIdRef = useRef<string | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
   // Keep the transcript pinned to the latest turn.
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [messages]);
+
+  // Load the durable transcript (tome-owned store) on mount, and seed both the
+  // tome session id and the SDK resume hint so the chat continues across reloads.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(`/api/tome/projects/${slug}/chat/history`);
+        if (!res.ok) return;
+        const data = (await res.json().catch(() => null))?.data;
+        if (cancelled || !data) return;
+        sessionIdRef.current = data.session?.id ?? null;
+        sessionRef.current = data.session?.sdkSessionId ?? null;
+        const msgs: ChatMsg[] = (data.messages ?? []).map(
+          (m: { role: Role; content?: string; parts?: Part[] | null }) => ({
+            role: m.role,
+            parts:
+              Array.isArray(m.parts) && m.parts.length
+                ? m.parts
+                : [{ kind: "text", text: m.content ?? "" }],
+          }),
+        );
+        setMessages(msgs);
+      } finally {
+        if (!cancelled) setLoadingHistory(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [slug]);
+
+  // Persist a finished message to the tome-owned store (best-effort — chat
+  // still works if this fails). Threads the durable session id through and
+  // records the latest SDK session id on the assistant turn.
+  const persist = useCallback(
+    async (
+      role: Role,
+      parts: Part[],
+      content: string,
+      sdkId?: string | null,
+    ) => {
+      try {
+        const res = await fetch(`/api/tome/projects/${slug}/chat/history`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            role,
+            content,
+            parts,
+            session_id: sessionIdRef.current,
+            sdk_session_id: sdkId ?? undefined,
+          }),
+        });
+        if (res.ok) {
+          const sid = (await res.json().catch(() => null))?.data?.sessionId;
+          if (typeof sid === "string") sessionIdRef.current = sid;
+        }
+      } catch {
+        /* best-effort persistence */
+      }
+    },
+    [slug],
+  );
+
+  const textOf = (parts: Part[]): string =>
+    parts.map((p) => (p.kind === "text" ? p.text : "")).join("");
 
   const send = useCallback(async () => {
     const text = input.trim();
@@ -67,6 +133,14 @@ export function ChatPanel({ slug, onPagesChanged, onOpenPage }: Props) {
       { role: "assistant", parts: [], pending: true },
     ]);
 
+    // Persist the user turn — this also creates the durable session on the very
+    // first message (so the assistant turn, persisted on completion, finds it).
+    void persist("user", [{ kind: "text", text }], text);
+
+    // Mirror the assistant parts locally: setMessages is async, so we keep a
+    // deterministic copy to persist once the turn completes.
+    const assistantParts: Part[] = [];
+
     // Mutate the last (assistant) message in place as the stream arrives.
     const patchLast = (fn: (m: ChatMsg) => ChatMsg) =>
       setMessages((msgs) => {
@@ -77,7 +151,10 @@ export function ChatPanel({ slug, onPagesChanged, onOpenPage }: Props) {
 
     // Append a token to the trailing text part, or open a new one if the last
     // part was a tool — this is what keeps text/tool order intact.
-    const appendToken = (t: string) =>
+    const appendToken = (t: string) => {
+      const lastLocal = assistantParts[assistantParts.length - 1];
+      if (lastLocal && lastLocal.kind === "text") lastLocal.text += t;
+      else assistantParts.push({ kind: "text", text: t });
       patchLast((m) => {
         const parts = m.parts.slice();
         const last = parts[parts.length - 1];
@@ -88,12 +165,15 @@ export function ChatPanel({ slug, onPagesChanged, onOpenPage }: Props) {
         }
         return { ...m, parts };
       });
+    };
 
-    const pushTool = (label: string, path?: string) =>
+    const pushTool = (label: string, path?: string) => {
+      assistantParts.push({ kind: "tool", label, path });
       patchLast((m) => ({
         ...m,
         parts: [...m.parts, { kind: "tool", label, path }],
       }));
+    };
 
     const pushErrorIfEmpty = (message: string) =>
       patchLast((m) => {
@@ -139,18 +219,27 @@ export function ChatPanel({ slug, onPagesChanged, onOpenPage }: Props) {
         onError: pushErrorIfEmpty,
       });
       patchLast((m) => ({ ...m, pending: false }));
+      // Persist the assistant turn + the latest SDK session id (resume hint).
+      if (assistantParts.length) {
+        void persist(
+          "assistant",
+          assistantParts,
+          textOf(assistantParts),
+          sessionRef.current,
+        );
+      }
     } catch (e) {
       pushErrorIfEmpty(String((e as Error)?.message ?? e));
     } finally {
       setStreaming(false);
     }
-  }, [input, streaming, slug, onPagesChanged]);
+  }, [input, streaming, slug, onPagesChanged, persist]);
 
   return (
     <div className="flex h-full flex-col">
       <ScrollArea viewportRef={scrollRef} className="flex-1">
         <div className="mx-auto flex max-w-3xl flex-col gap-5 px-6 py-8">
-          {messages.length === 0 && <EmptyState slug={slug} />}
+          {messages.length === 0 && !loadingHistory && <EmptyState slug={slug} />}
           {messages.map((m, i) => (
             <MessageRow key={i} msg={m} onOpenPage={onOpenPage} />
           ))}
