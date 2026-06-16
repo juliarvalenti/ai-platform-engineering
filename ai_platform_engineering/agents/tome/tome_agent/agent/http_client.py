@@ -48,12 +48,11 @@ def _auth_headers() -> dict[str, str]:
 
 
 # The container is multi-project: each request scopes itself to the project in
-# its snapshot. The active id is set per-request (set_active_project_id) and read
-# here; the env var is only a single-project fallback. ContextVars are
-# task-local, so concurrent requests for different projects can't clobber each
-# other. Callbacks that MUST hit the right project (page writes/reads) also take
-# an explicit `project_id` override, in case the SDK runs a hook outside this
-# context.
+# its snapshot. The active id is set per-request (set_active_project_id) and
+# read here. ContextVars are task-local, so concurrent requests for different
+# projects can't clobber each other. Callbacks that MUST hit the right project
+# (page writes/reads) also accept an explicit `project_id` override, in case
+# the SDK runs a hook outside this context.
 _active_project_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "tome_active_project_id", default=None
 )
@@ -68,14 +67,12 @@ def _project_id() -> str:
     # CAIPE project ids are Mongo ObjectId hex / slugs, not UUIDs. Treat as
     # an opaque string used only to build callback URLs.
     active = _active_project_id.get()
-    if active:
-        return active
-    raw = os.environ.get("TTT_PROJECT_ID")
-    if not raw:
+    if not active:
         raise RuntimeError(
-            "no active project id (set_active_project_id) and TTT_PROJECT_ID unset"
+            "no active project id — set_active_project_id() must be called at "
+            "the start of every request (multi-project agent has no env fallback)"
         )
-    return raw
+    return active
 
 
 # ---------- async API used by the agent's request handlers ----------

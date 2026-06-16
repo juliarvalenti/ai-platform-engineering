@@ -29,7 +29,6 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-import httpx
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import PlainTextResponse, StreamingResponse
 
@@ -68,24 +67,12 @@ async def lifespan(app: FastAPI):
         raise RuntimeError(
             "At least one of ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN must be set"
         )
-    project_id = os.environ.get("TTT_PROJECT_ID")
-    backend_url = os.environ.get("TTT_BACKEND_URL")
-    if not project_id or not backend_url:
-        log.warning("agent missing TTT_PROJECT_ID or TTT_BACKEND_URL — readyz will return 503")
-    else:
-        # Reachability check — confirm we can hit the backend's snapshot
-        # endpoint. We don't cache the result; per-request handlers
-        # fetch a fresh snapshot anyway.
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.get(
-                    f"{backend_url.rstrip('/')}/api/internal/projects/{project_id}/snapshot",
-                    headers={"Authorization": f"Bearer {os.environ.get('TTT_AGENT_TOKEN', '')}"},
-                )
-                _state.ready = resp.status_code == 200
-        except httpx.HTTPError:
-            log.exception("ready probe failed during lifespan startup")
-            _state.ready = False
+    # The agent is multi-project: it has no single project to probe at startup.
+    # Each request fetches a fresh snapshot for its own project_id; the per-request
+    # path is the real readiness signal. Mark ready once basic env is present.
+    if not os.environ.get("TTT_BACKEND_URL"):
+        log.warning("agent missing TTT_BACKEND_URL — requests will fail at callback time")
+    _state.ready = True
     yield
 
 
